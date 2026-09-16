@@ -1,0 +1,14 @@
+.program scc_dac
+
+; SCC audio DAC PIO program.
+;
+; Shifts one bit per instruction from the TX FIFO to GPIO, producing a
+; 1-bit pulse-density-modulated (PDM) stream. The C++ code configures:
+;   - output pin: GPIO 26
+;   - autopull: 32 bits, LSB first
+;   - FIFO join: TX only
+;   - clock divider: system clock / 4 MHz bit rate
+
+.wrap_target
+    out pins, 1
+.wrap
