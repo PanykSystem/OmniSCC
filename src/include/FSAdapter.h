@@ -10,14 +10,23 @@
 #ifndef __FS_ADOPT_H__
 #define __FS_ADOPT_H__
 
-#include "FSAdapter.h"
+#include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+bool _fs_unmount(void);
+bool _fs_initialize(void);
 bool _fs_create();
 bool _fs_mount();
 bool _fs_is_mounted();
 uint32_t _fs_read(uint8_t* buff, uint32_t sector, uint32_t count);
 uint32_t _fs_write(const uint8_t* buff, uint32_t sector, uint32_t count);
 void _fs_sync();
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,0 +1,25 @@
+[LOADER]
+default=6
+delay=3000
+scc_on_exit=1
+scc_volume=100
+color_rom=10
+color_dsk=7
+fav0=GooniesR.ROM, Goonies
+fav1=Aleste [ASCII16].rom, Aleste [ASCII16]
+fav2=Penguin.rom
+fav3=Road Fighter.rom, Road Fighter
+fav4=Vampire Killer (1986) (Konami) (J) [a3].rom, Vampire Killer
+fav5=Parodius.rom, Parodius
+fav6=F1-Spirit.rom, F1 Spirit
+fav7=Bubble Bobble [ASCII8].mx2, Bubble Bobble [ASCII8]
+fav8=The Treasure of Usas (1987) (Konami) (j).rom, The Treasure of Usas
+fav9=vkilscc.rom, Vampire Killer (SCC)
+
+
+
+; 0 disables numbered disk switching
+multidisk=1
+
+; External ROM mapper database; empty disables hash lookup.
+romdb=/romdb.bin

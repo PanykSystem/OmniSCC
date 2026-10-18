@@ -13,11 +13,11 @@
 ; readable titles. See
 ; docs/superpowers/specs/2026-09-12-loader-browser-design.md.
 ;
-; Assembles to loader.rom, which is the name the firmware loads: this menu is
-; the one the cartridge ships with. The favourites menu assembles to
-; loader_fav.rom and is copied to the volume over it.
+; Standalone build: loader.rom; universal build: loader_auto.rom. The preloader
+; discovers loader*.rom; firmware mapper detection uses the OmniSCC signature.
 ;
-; Required files: font.inc, vdp.inc, mailbox.inc (the last two shared with
+; loader_auto.asm selects SCREEN 1 or SCREEN 5 inside this same browser.
+; Required files for the graphical variant: font.inc, vdp.inc, mailbox.inc (shared with
 ; loader_fav.asm, which is why they are includes and not copies).
 ; -----------------------------------------------------------------------------
 
@@ -59,6 +59,7 @@ FILVRM          EQU $0056
 KILBUF          EQU $0156
 CHSNS           EQU $009C
 CHGET           EQU $009F
+SNSMAT          EQU $0141
 CHPUT           EQU $00A2
 
 HIMEM           EQU $FC4A    ; top of free RAM: everything this loader uses in
@@ -138,13 +139,21 @@ INI_BUF_MAX     EQU 2047
 ; labels: last=, disk2= and diskrom= are about 72 bytes each at worst and the
 ; other two under 30, so 245 is the real worst case and this is the round number
 ; above it.
-INI_KEYS_RESERVE EQU 384
+INI_KEYS_RESERVE EQU 512
 
 SavedSP         EQU $C800
 IniSize         EQU $C802
 CfgDelay        EQU $C804    ; countdown, in frames, counted down to zero
 CfgDelayMs      EQU $C8CE    ; the configured delay in milliseconds, untouched
                              ; by the countdown -- this is what gets saved
+VolumeFrames    EQU $D4B8
+VolumeDirty     EQU $D4B9
+RbscProgress    EQU $D4BA    ; next letter of the hidden keyboard sequence
+DiskStatusVisible EQU $D4BB  ; temporary B: footer, dismissed by the next input
+VolumeText      EQU RowBuf
+VOLUME_BROWSER EQU 1
+CfgSccVolume    EQU $D4B7
+CfgMultidisk    EQU $D4B6
 CfgSccOnExit    EQU $C806
 SelectedType    EQU $C807    ; 0 = ROM entry, 1 = .dsk image
 SelIndex        EQU $C808    ; highlighted entry, 0-based
@@ -170,6 +179,9 @@ SortI           EQU $C819    ; insertion-sort cursors
 SortJ           EQU $C81B
 AutoBoot        EQU $C81D    ; non-zero: the countdown should boot LastPath
 BootFailed      EQU $C81E    ; BOOT_FAILED_MARK after a failed mount; see Init
+JoystickState   EQU $C820    ; five bytes, shared joystick polling state
+HelpActive      EQU $C825    ; modal help is visible
+HelpF1Held      EQU $C826    ; one toggle per physical F1 press
 ZeroSeen        EQU $C81F    ; AppendNumber's leading-zero state
 BOOT_FAILED_MARK EQU $A5
 Disk2Path       EQU $C830    ; disk2=, 65 bytes: the image in drive B
@@ -183,7 +195,7 @@ AliasPtr        EQU $C8C2    ; AcceptEntry's pointer to the 8.3 alias
 SortSlot        EQU $C8C4    ; &SortOrder[j] while one element sinks
 LeftPtr         EQU $C8C6    ; the entry SortOrder[j-1] names
 LastSecs        EQU $C8C8    ; seconds last shown by the countdown
-CountStr        EQU $C8CA    ; "Ns" as drawn, 4 bytes
+CountStr        EQU $C8CA    ; seconds as decimal digits, 4 bytes
 PrevSel         EQU $C8D0    ; selection and window as last PAINTED, so MoveTo
 PrevTop         EQU $C8D2    ; can tell a scroll from a cursor step
 NewSel          EQU $C8D4    ; where the current move is taking the cursor
@@ -204,10 +216,8 @@ SAFERAM         EQU $CA00
 ; at startup by BuildGlyphTable. One kilobyte to make the renderer five times
 ; faster; see DrawBand.
 ;
-; Two of them, because a row is painted in one pass and its colour therefore has
-; to be baked into the table: files in white, directories in grey. Grey rather
-; than another hue on purpose -- it has to read as different on a monochrome
-; monitor, where a hue change is no change at all.
+; A fixed UI table and a reusable entry table, rebuilt on foreground changes.
+; This avoids reserving an extra kilobyte at the expense of directory capacity.
 GlyphTable      EQU $CB00
 GlyphTableDir   EQU $CF00
 
@@ -232,7 +242,23 @@ DiskRomName     EQU $D418    ; diskrom=, DISKROM_BUF_SIZE bytes
 
 ; And the table itself, which is the only part whose size is decided at run
 ; time -- see ComputeEntryCap.
-EntryTable      EQU $D480
+NextorRomName   EQU $D459
+NextorInvalid   EQU $D49B
+CfgColorDir     EQU $D49E
+CfgColorRom     EQU $D49F
+CfgColorDsk     EQU $D4A0
+RowColor        EQU $D4A1
+FwHelpText      EQU $D4A2    ; 16 bytes, below EntryTable
+NextorLastError EQU $D49C
+NEXTOR_BROWSER EQU 1
+
+    IFDEF ROM_DATABASE_MENU
+CfgKucOptions   EQU $D501
+RomDatabasePath EQU $D4C0
+EntryTable      EQU $D508
+    ELSE
+EntryTable      EQU $D4C0
+    ENDIF
 
 ; One entry: an attribute, what it is listed as, and the name to open.
 ;
@@ -269,39 +295,44 @@ PATH_MAX        EQU 64
 DISKROM_NAME_MAX EQU PATH_MAX
 DISKROM_BUF_SIZE EQU DISKROM_NAME_MAX + 1
 
-; Screen geometry. Rows keep loader_fav.asm's 12-pixel pitch from Y=40, which is
-; what the shared renderer draws at. Twelve of them fit inside the box drawn by
-; CmdFill (y=36..185): row 12 ends at 179. The hint line goes below the box at
-; 192, where loader_fav.asm puts its own.
-LIST_ROWS       EQU 12
+; Screen geometry: sixteen 8-pixel rows with one pixel of separation.
+; The final row ends at 183, inside CmdFill (y=36..185).
+LIST_ROWS       EQU 16
 LIST_Y0         EQU 40
-LIST_PITCH      EQU 12
+LIST_PITCH      EQU 9
 LIST_X          EQU 16
-LIST_WIDTH      EQU 26       ; characters per row, including the [D] marker
+LIST_WIDTH      EQU 26       ; characters per row, including the folder symbol
 ; The scroll hints sit in their own column to the RIGHT of the list, outside the
 ; rectangle the block move shifts. Inside it they rode along with the pixels: a
 ; `v` drawn on the bottom row stayed visible on every row it was scrolled up
 ; through, and the arrows accumulated down the window.
 HINT_X          EQU LIST_X + LIST_WIDTH * 8
 
-; Colours. Files are white; directories take the same colour as the footer's
-; text, which differs from white in brightness and so survives a monochrome
-; monitor; the background is the window's blue. The highlight XORs the first and
-; the last of these, which is why the mask is derived here rather than written as
-; a number -- and note what it does to a directory row: 10 xor 11 is 1, so a
-; selected directory comes out black on white.
+
+; Fixed UI colors. Entry foregrounds are configured independently in the INI.
+; XOR highlighting is reversible for every entry color.
 COLOR_TEXT      EQU 15
 COLOR_FOOTER    EQU 10
-COLOR_DIR       EQU COLOR_FOOTER
 COLOR_BG        EQU 4
 HILITE_MASK     EQU COLOR_TEXT ^ COLOR_BG
+    IFDEF AUTO_LOADER
+FOOTER_X        EQU 40       ; centered 22-character Help/Open hint
+FOOTER_Y        EQU 200      ; shared Help/Open and temporary drive B status
+    ELSE
+FOOTER_X        EQU 32
 FOOTER_Y        EQU 192
+    ENDIF
 FOOTER_CHARS    EQU 24       ; what DrawString8x8 draws, and what fits the
                              ; line below the box, like loader_fav.asm's
                              ; hint line
-COUNT_X         EQU 208      ; the countdown, right of the key hints
-PATH_X          EQU 120      ; 15 characters end at 240, inside the box's 244
-PATH_CHARS      EQU 15
+COUNT_X         EQU 226      ; fixed 24x12 badge, clear of title and path
+COUNT_Y         EQU 2
+TITLE_X         EQU 8
+TITLE_Y         EQU 2
+PATH_X          EQU 16
+PATH_Y          EQU 24
+PATH_CHARS      EQU 28
+
 
 ; =============================================================================
 ; ROM HEADER
@@ -313,7 +344,7 @@ RomHeader:
     dw      0, 0, 0, 0, 0, 0
 
 RomSignature:
-    db      "PICOCART"
+    db      "OmniSCC", 0         ; loader mapper signature at ROM offset 16
 
 ; =============================================================================
 ; INITIALIZATION
@@ -321,6 +352,9 @@ RomSignature:
 
 Init:
     di
+    IFDEF AUTO_LOADER
+    call    DetectUi
+    ENDIF
     ld      (SavedSP), sp
 
     ; The mailbox poll goes into RAM before any command is sent: a command stops
@@ -332,17 +366,23 @@ Init:
     ldir
 
     call    ClearConfig
+    ld      a, (BootFailed)
+    cp      BOOT_FAILED_MARK
+    call    nz, InitJoystick
     call    InitHiliteCmd
-    call    BuildGlyphTable
     call    ComputeEntryCap
 
     ; Screen 5 through the BIOS, colours, then interrupts off for rendering.
+    IFDEF AUTO_LOADER
+    call    InitAutoScreen
+    ELSE
     xor     a
     ld      (DPPAGE), a
     ld      (ACPAGE), a
 
     ld      a, 5
     call    CHGMOD
+    ENDIF
 
     ld      a, 15
     ld      (FORCLR), a
@@ -350,6 +390,10 @@ Init:
     ld      (BAKCLR), a
     ld      (BDRCLR), a
     call    CHGCLR
+
+    IFDEF AUTO_LOADER
+    call    DrawStartupSplash
+    ENDIF
 
     di
 
@@ -372,6 +416,15 @@ Init:
     ld      (de), a
 
 .noIni:
+    IFDEF ROM_DATABASE_MENU
+    call    ApplyRomDatabase
+    call    ApplyKucOptions
+    ENDIF
+    call    ApplyDiskOptions
+    IFDEF AUTO_LOADER
+    call    ApplySccVolume
+    ENDIF
+    call    BuildGlyphTable
     ; Milliseconds to VBlank frames (~50 Hz), as loader_fav.asm does it. The
     ; milliseconds stay where they are: the countdown consumes CfgDelay, and
     ; saving reads CfgDelayMs.
@@ -385,6 +438,17 @@ Init:
     inc     bc
     jr      .div20
 .divDone:
+    IFDEF AUTO_LOADER
+    ld a, b
+    or c
+    jr nz, .storeFrames
+    ld hl, (CfgDelayMs)
+    ld a, h
+    or l
+    jr z, .storeFrames
+    inc bc
+.storeFrames:
+    ENDIF
     ld      (CfgDelay), bc
 
     ; A mount that just failed came back here through the stub. Do not count
@@ -402,19 +466,20 @@ Init:
     ; Start in the directory last= lives in, so the browser opens where it was
     ; left. An empty or rootless last= starts at the root.
     call    StartDirFromLast
+    IFDEF AUTO_LOADER
+    call    DisableZeroDelay
+    ENDIF
 
-    ; Screen 5 again, and only now draw. The ini was read through the mailbox
-    ; with the BIOS interrupt live, and loader_fav.asm re-establishes the
-    ; screen at exactly this point for the same reason: whatever ran during
-    ; that traffic does not get to leave anything on top of the window.
-    ; Drawing the frame first and reading the ini afterwards -- which is what
-    ; this did -- lost the frame.
+    ; Preserve the splash while preparing the menu's hidden page.
+    IFDEF AUTO_LOADER
+    call    PrepareStartupMenu
+    ELSE
     xor     a
     ld      (DPPAGE), a
     ld      (ACPAGE), a
-
     ld      a, 5
     call    CHGMOD
+    ENDIF
 
     ld      a, 15
     ld      (FORCLR), a
@@ -428,15 +493,23 @@ Init:
     call    DrawFrame
     call    ReadDirectory
     call    ResetSelection
+    IFDEF AUTO_LOADER
+    call    RestoreLastSelection
+    ENDIF
     call    DrawList
     call    DrawFooter
     call    DrawCountdown
 
+    IFDEF AUTO_LOADER
+    call    ShowStartupScreen
+    call    ResetVramPage
+    ELSE
     xor     a
     out     (VDP_CTRL), a
     ld      a, $8E
     out     (VDP_CTRL), a
 
+    ENDIF
     ei
 
     ; Let the display settle before the first poll, as loader_fav.asm does.
@@ -451,10 +524,22 @@ Init:
 
 PollLoop:
     halt
+    IFDEF AUTO_LOADER
+    call    TickVolume
+    ENDIF
+    call    PollHelpKey
+    jp      nz, ToggleHelp
+    ld      a, (HelpActive)
+    or      a
+    jr      z, .browser
+    call    CHSNS
+    jp      nz, DispatchKey
+    jr      PollLoop
+.browser:
 
-    ; The keyboard is read BEFORE the countdown is touched. delay=0 expires on
-    ; this very frame, and checking the countdown first meant the menu booted
-    ; before a key could ever be seen -- with delay=0 there was no way into it.
+    ; Read input before advancing any enabled countdown.
+    call    PollJoystick
+    jr      nz, .gotJoystick
     call    CHSNS
     jr      nz, .gotKey
 
@@ -486,25 +571,78 @@ PollLoop:
     ld      hl, LastPath
     call    BootPath
 
+.gotJoystick:
+    IFDEF AUTO_LOADER
+    call    DismissDiskStatus
+    ENDIF
+    cp      8
+    jp      z, JoystickBack
+    jp      DispatchInput
+
 .gotKey:
 ; -----------------------------------------------------------------------------
 ; DispatchKey reads one key and acts on it. MoveTo jumps back here while more
 ; keys are still queued, so a burst is consumed before anything is painted.
 ; -----------------------------------------------------------------------------
 DispatchKey:
-    ; Any keypress cancels the countdown for good -- including one this loop
-    ; does nothing else with, which is why the flag goes up before the key is
-    ; even read and dispatched.
+    call    CHGET
+    IFDEF AUTO_LOADER
+    push af
+    ld a, (HelpActive)
+    cp 3
+    jr nz, .notRbscLogo
+    pop af
+    jp CloseHelp                   ; every keyboard character closes the emblem
+.notRbscLogo:
+    pop af
+    call FeedRbscKey
+    jp c, OpenRbscLogo
+    ENDIF
+
+
+DispatchInput:
+    ld      b, a
+    ld      a, (HelpActive)
+    or      a
+    ld      a, b
+    jr      z, .browser
+    cp      $1B
+    jp      z, CloseHelp
+    jp      PollLoop
+.browser:
+    IFDEF AUTO_LOADER
+    call    DismissDiskStatus
+    ENDIF
+    push    af
     ld      a, 1
     ld      (CountdownStop), a
-    call    DrawCountdown           ; blanks the field: the timer is gone
-
-    call    CHGET
-
+    call    DrawCountdown
+    pop     af
+    IFDEF AUTO_LOADER
+    cp      '+'
+    jp      z, VolumeUpKey
+    cp      '-'
+    jp      z, VolumeDownKey
+    cp      $1B
+    jr      nz, .dismissVolume
+    ld      a, (VolumeFrames)
+    or      a
+    jr      z, .ordinaryEscape
+    call    DismissVolume
+    jp      PollLoop
+.ordinaryEscape:
+    ld      a, $1B
+.dismissVolume:
+    push    af
+    call    DismissVolume
+    pop     af
+    ENDIF
     cp      $1B
     jp      z, ExitToBasic          ; ESC
     cp      13
     jp      z, EnterSelected        ; RETURN
+    cp      ' '
+    jp      z, EnterSelected        ; SPACE
     cp      8
     jp      z, GoParent             ; BS
     cp      30
@@ -515,9 +653,11 @@ DispatchKey:
     jr      z, .pageUp              ; cursor LEFT
     cp      28
     jr      z, .pageDown            ; cursor RIGHT
-    cp      ' '
-    jp      z, .setDisk2            ; jp: the handler is past jr's reach
-    jr      PollLoop
+    cp      $12
+    jp      z, .setDisk2            ; INS assigns B
+    cp      $7F
+    jp      z, .clearDisk2          ; DEL clears B
+    jp      PollLoop
 
 .up:
     ld      hl, (SelIndex)
@@ -563,9 +703,8 @@ DispatchKey:
     jp      MoveTo
 
 .setDisk2:
-    ; SPACE puts the highlighted .dsk in drive B, and takes it out again when it
-    ; is already there, so one key does both. Only a .dsk: nothing else is a
-    ; disk, and drive A is what RETURN boots.
+    ; INS assigns the highlighted .dsk to B. It never toggles the assignment;
+    ; DEL clears B independently of the highlighted entry.
     ld      hl, (EntryCount)
     ld      a, h
     or      l
@@ -591,15 +730,18 @@ DispatchKey:
     ld      hl, FullPath
     ld      de, Disk2Path
     call    StrEqNoCase
-    jr      nz, .assign
-    xor     a
-    ld      (Disk2Path), a          ; the same image again: eject it
-    jr      .disk2Saved
-
-.assign:
+    jp      z, PollLoop            ; repeated INS does not rewrite flash
     ld      hl, FullPath
     ld      de, Disk2Path
     call    StrCopy
+    jr      .disk2Saved
+
+.clearDisk2:
+    ld      a, (Disk2Path)
+    or      a
+    jp      z, PollLoop            ; already empty: avoid a flash rewrite
+    xor     a
+    ld      (Disk2Path), a
 
 .disk2Saved:
     ; Written out now rather than at boot, so the assignment survives an exit to
@@ -607,6 +749,9 @@ DispatchKey:
     ; the buffer was compacted at startup, so this pass copies each name= line
     ; onto itself and the label pointers the list holds stay valid.
     call    SaveIni
+    IFDEF AUTO_LOADER
+    call    DrawList
+    ENDIF
     call    DrawDisk2
     jp      PollLoop
 
@@ -653,6 +798,14 @@ MoveTo:
     xor     a
     ld      (PaintPending), a
 
+    IFDEF AUTO_LOADER
+    ld      a, (UiText)
+    or      a
+    jr      z, .graphicMove
+    call    DrawList
+    jp      PollLoop
+.graphicMove:
+    ENDIF
     ; Did the window move, and by how much?
     ld      hl, (ScrollTop)
     ld      de, (PrevTop)
@@ -699,6 +852,7 @@ MoveTo:
     call    HiliteRow               ; onto the row it is on now
     jp      PollLoop
 
+
 ; =============================================================================
 ; SELECTION AND NAVIGATION
 ; =============================================================================
@@ -732,6 +886,8 @@ ClampScroll:
     ret
 
 ResetSelection:
+    xor     a
+    ld      (PaintPending), a       ; RAM may contain FF at power-on
     ld      hl, 0
     ld      (SelIndex), hl
     ld      (ScrollTop), hl
@@ -773,6 +929,12 @@ EnterSelected:
 ; -----------------------------------------------------------------------------
 ; GoParent: truncate CurPath at its last '/'. At the root it does nothing.
 ; -----------------------------------------------------------------------------
+JoystickBack:
+    ld      a, (CurPath+1)
+    or      a
+    jp      z, ExitToBasic
+    jp      GoParent
+
 GoParent:
     ld      hl, CurPath
     ld      de, 0                   ; DE = address of the last '/', 0 if none
@@ -1051,6 +1213,18 @@ FindLabel:
 MatchLabelValue:
     ld      de, (NamePtr)
 .cmp:
+    IFDEF ROM_DATABASE_MENU
+    push    hl
+    ex      de, hl
+    ld      a, (hl)
+    cp      '['
+    call    z, SkipMapperTag
+    ex      de, hl
+    pop     hl
+    ld      a, (hl)
+    cp      '['
+    call    z, SkipMapperTag
+    ENDIF
     ld      a, (de)
     or      a
     jr      z, .nameEnd
@@ -1150,6 +1324,22 @@ IsNameLine:
 IsBootable:
     push    hl
     ld      de, StrLoaderRom
+    call    StrEqNoCase
+    pop     hl
+    jr      z, .no
+    IFDEF AUTO_LOADER
+    DEFINE HIDE_LITE_ROM
+    ELSE
+    ENDIF
+    IFDEF HIDE_LITE_ROM
+    push    hl
+    ld      de, StrLiteRom
+    call    StrEqNoCase
+    pop     hl
+    jr      z, .no
+    ENDIF
+    push    hl
+    ld      de, StrDiskRom
     call    StrEqNoCase
     pop     hl
     jr      z, .no
@@ -1527,7 +1717,8 @@ AppendEntryToPath:
 
 ; -----------------------------------------------------------------------------
 ; BootPath boots the path at HL: .dsk images go through CMD_MAP_DISK and a soft
-; reset, everything else through CMD_MAP_FILE and the cartridge's init vector.
+; reset, Nextor kernels through CMD_MAP_NEXTOR and a soft reset, everything
+; else through CMD_MAP_FILE and the cartridge's init vector.
 ;
 ; The ini is written first. Once the cartridge is swapped there is no ROM left
 ; to run a save from, and the point of the whole browser is that the choice
@@ -1537,6 +1728,10 @@ BootPath:
     ; Remember the choice, then persist it.
     ld      de, LastPath
     call    StrCopy
+
+    ld      hl, LastPath
+    call    IsNextorPath
+    jp      z, BootNextorPath
 
     ld      hl, LastPath
     call    IsDskPath
@@ -1559,6 +1754,8 @@ BootPath:
     call    StrCopy
     ld      hl, Disk2Path
     call    StrCopy
+
+    call    PrepareMountTimeout
 
     ; Hand the machine over with a clean screen. Screen 5's VRAM is nothing like
     ; what a game expects to find, and leaving it there shows up as garbage
@@ -1598,10 +1795,33 @@ RestoreBootScreen:
     ld      a, 1
     call    CHGMOD
 
+    IFDEF AUTO_LOADER
+    DEFINE ATOMIC_BOOT_CLEAR
+    ELSE
+    ENDIF
+    IFDEF ATOMIC_BOOT_CLEAR
+    ; MSX1 CHGMOD/FILVRM can enable interrupts. Hide the BIOS cursor and
+    ; perform an atomic, paced fill instead of calling FILVRM.
+    di
+    xor     a
+    ld      ($FCA9), a
+    ld      hl, 0
+    call    SETWRT
+    di
+    ld      bc, $4000
+.clearTextBoot:
+    xor     a
+    out     (VDP_DATA), a
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .clearTextBoot
+    ELSE
     xor     a
     ld      hl, $0000
     ld      bc, $4000
     call    FILVRM
+    ENDIF
     ret
 
 ; -----------------------------------------------------------------------------
@@ -1684,47 +1904,22 @@ SwitchStubRom:
                                     ; disk interface, whose INIT only runs then
 
 .failed:
-    ; Say why and go back to the menu rather than resetting blind: a failed
-    ; mount usually means a missing file, and a reset loop hides that.
-    ei
-    call    INITXT
-    call    KILBUF
-
-    ld      hl, FailMsg
-.print:
-    ld      a, (hl)
-    or      a
-    jr      z, .waitKey
-    push    hl
-    call    CHPUT
-    pop     hl
-    inc     hl
-    jr      .print
-
-.waitKey:
-    call    CHSNS
-    jr      z, .waitKey
-    call    CHGET
-
-    ld      a, BOOT_FAILED_MARK
-    ld      (BootFailed), a         ; Init reads this and arms no countdown
-    jp      Init
-
-FailMsg:
-    db      13, 10
-    db      "MOUNT FAILED", 13, 10
-    db      "CHECK THE FILE EXISTS,", 13, 10
-    db      "AND disk.rom FOR .DSK", 13, 10
-    db      "PRESS ANY KEY...", 0
+    cp      MAIL_TIMEOUT
+    jp      z, MountTimeoutRAM
+    jp      MountFailed             ; failure: original ROM is still mapped
 
     ENT
 SwitchStubEnd:
+    ASSERT SwitchStubEnd-SwitchStubRom <= $80
 
 ; =============================================================================
 ; EXIT
 ; =============================================================================
 
 ExitToBasic:
+    IFDEF AUTO_LOADER
+    call    PersistVolume
+    ENDIF
     ld      a, 15
     ld      (FORCLR), a
     ld      a, 4
@@ -1778,62 +1973,87 @@ SccExitStubEnd:
 ; RENDERING
 ; =============================================================================
 
-; -----------------------------------------------------------------------------
-; Interrupts are off around every one of these, and that is not optional: see
-; the banner above DrawFooter.
-; -----------------------------------------------------------------------------
-DrawFrame:
-    di
-    ld      hl, CmdShadow
-    call    DrawBoxVDP
-    ld      hl, CmdBorder
-    call    DrawBoxVDP
-    ld      hl, CmdFill
-    call    DrawBoxVDP
-    call    WaitVDP
-
-    ld      a, COLOR_TEXT
-    ld      (TextColor), a
-    ld      a, COLOR_BG
-    ld      (TextBgColor), a
-    ld      hl, MsgTitle
-    ld      d, 16
-    ld      e, 20
-    call    DrawString8x8
-    ei
-
-    jp      DrawPath                ; which disables them around its own drawing
-
-; -----------------------------------------------------------------------------
-; DrawPath shows the directory being listed, in the header. A path longer than
-; the field is shown by its tail -- the end is the part that identifies it.
-; -----------------------------------------------------------------------------
-DrawPath:
-    ld      a, 10
-    ld      (TextColor), a
-    ld      a, 4
-    ld      (TextBgColor), a
-
-    ld      hl, CurPath
-    call    StrLen
-    ld      a, b
-    cp      PATH_CHARS + 1
-    jr      c, .short
-    ld      c, b
-    ld      b, 0
-    add     hl, bc                  ; HL -> the terminator
-    ld      bc, PATH_CHARS
+    IFDEF AUTO_LOADER
+; Preserve the input character and dispatch state while restoring the footer.
+DismissDiskStatus:
+    push    af
+    ld      a, (DiskStatusVisible)
     or      a
-    sbc     hl, bc                  ; HL -> the last PATH_CHARS characters
-
-.short:
-    di
-    ld      d, PATH_X
-    ld      e, 20
-    ld      b, PATH_CHARS
-    call    DrawStringPadded
-    ei
+    jr      z, .done
+    push    bc
+    push    de
+    push    hl
+    call    DrawFooter
+    pop     hl
+    pop     de
+    pop     bc
+.done:
+    pop     af
     ret
+    ENDIF
+
+; F1 is a matrix key, not a character: CHGET would return its BASIC macro.
+; Drain that macro while held, and toggle only on a new press.
+PollHelpKey:
+    ld      a, 6
+    call    SNSMAT
+    and     $20
+    jr      z, .pressed
+    xor     a
+    ld      (HelpF1Held), a
+    ret
+.pressed:
+    call    KILBUF
+    ld      a, (HelpF1Held)
+    or      a
+    jr      z, .newPress
+    xor     a
+    ret
+.newPress:
+    inc     a
+    ld      (HelpF1Held), a
+    or      a
+    ret
+
+ToggleHelp:
+    IFDEF AUTO_LOADER
+    xor a
+    ld (RbscProgress), a
+    ld a, (HelpActive)
+    cp 3
+    jp z, CloseHelp
+    ENDIF
+    IFDEF AUTO_LOADER
+    call    DismissVolume
+    ENDIF
+    ld      a, (HelpActive)
+    IFDEF AUTO_LOADER
+    cp      2
+    jp      z, CloseHelp
+    ELSE
+    or      a
+    jp      nz, CloseHelp
+    ENDIF
+    inc     a
+    ld      (HelpActive), a
+    ld      (CountdownStop), a
+    call    DrawCountdown
+    call    DrawHelp
+    jp      PollLoop
+
+CloseHelp:
+    xor     a
+    ld      (HelpActive), a
+    call    KILBUF
+    call    DrawFrame
+    call    DrawList
+    call    DrawFooter
+    jp      PollLoop
+
+; One NUL-terminated string per line; an extra NUL ends the help table.
+    IFNDEF AUTO_LOADER
+    INCLUDE "graphic_frame.inc"
+    ENDIF
 
 ; -----------------------------------------------------------------------------
 ; ComputeEntryCap works out how many entries fit between the table and the stack
@@ -1905,507 +2125,12 @@ ComputeEntryCap:
 ; T-states per VRAM byte. That is most of the 1.8 ms a single character cell
 ; costs. With a table the inner loop is a fetch and an OUT.
 ;
-; One table is enough because every row is drawn in the same colours now -- the
-; selection is an XOR pass, not a second colour scheme.
+; The UI table is fixed; the second table caches the most recent entry color.
 ; -----------------------------------------------------------------------------
-BuildGlyphTable:
-    ld      hl, GlyphTable
-    ld      a, COLOR_TEXT
-    call    BuildOneTable
-    ld      hl, GlyphTableDir
-    ld      a, COLOR_DIR
-    ; fall through
+    IFNDEF AUTO_LOADER
+    INCLUDE "graphic_list.inc"
+    ENDIF
 
-BuildOneTable:
-    ld      (BuildFg), a
-    ld      c, 0                    ; C = the bit pattern being expanded
-.pattern:
-    ld      b, 4                    ; four VRAM bytes per pattern
-    ld      e, c
-.byteLoop:
-    ; Two pixels per byte, high nibble first.
-    ld      a, e
-    rlca
-    ld      e, a
-    ld      a, COLOR_BG
-    jr      nc, .haveFirst
-    ld      a, (BuildFg)
-.haveFirst:
-    add     a, a
-    add     a, a
-    add     a, a
-    add     a, a
-    ld      d, a
-
-    ld      a, e
-    rlca
-    ld      e, a
-    ld      a, COLOR_BG
-    jr      nc, .haveSecond
-    ld      a, (BuildFg)
-.haveSecond:
-    or      d
-    ld      (hl), a
-    inc     hl
-    djnz    .byteLoop
-
-    inc     c
-    jr      nz, .pattern
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawBand draws B characters of the string at HL as one eight-line band.
-;   in  HL = text, D = X (even), E = Y, B = characters
-;
-; The point is the loop order: one VRAM address per pixel line rather than one
-; per character, so the VDP\'s auto-increment carries across the whole row. That
-; turns 8 address setups per character into 8 per row -- 26 times fewer -- and
-; with the glyph table the rest is a fetch and an OUT per byte. A row costs
-; about 9 ms instead of 47.
-; -----------------------------------------------------------------------------
-DrawBand:
-    ld      (BandText), hl
-    ld      a, b
-    ld      (BandCount), a
-    call    BandVramAddr
-
-    xor     a
-    ld      (BandLine), a
-
-.lineLoop:
-    di
-    ld      hl, (BandAddr)
-    call    SetVramWrite
-
-    ld      hl, (BandText)
-    ld      a, (BandCount)
-    ld      b, a
-
-.charLoop:
-    push    bc
-    push    hl
-
-    ; This character\'s glyph line: Font8x8 + char * 8 + line.
-    ld      a, (hl)
-    ld      l, a
-    ld      h, 0
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    ld      de, Font8x8
-    add     hl, de
-    ld      a, (BandLine)
-    ld      e, a
-    ld      d, 0
-    add     hl, de
-    ld      a, (hl)
-
-    ; Its four VRAM bytes: GlyphTable + pattern * 4.
-    ld      l, a
-    ld      h, 0
-    add     hl, hl
-    add     hl, hl
-    ld      de, (BandTable)
-    add     hl, de
-
-    ld      a, (hl)
-    out     (VDP_DATA), a
-    inc     hl
-    ld      a, (hl)
-    out     (VDP_DATA), a
-    inc     hl
-    ld      a, (hl)
-    out     (VDP_DATA), a
-    inc     hl
-    ld      a, (hl)
-    out     (VDP_DATA), a
-
-    pop     hl
-    inc     hl
-    pop     bc
-    djnz    .charLoop
-
-    ei
-
-    ld      hl, (BandAddr)
-    ld      bc, 128                 ; one pixel line
-    add     hl, bc
-    ld      (BandAddr), hl
-
-    ld      a, (BandLine)
-    inc     a
-    ld      (BandLine), a
-    cp      8
-    jr      c, .lineLoop
-    ret
-
-; -----------------------------------------------------------------------------
-; BandVramAddr sets BandAddr from D = X (even) and E = Y: Y * 128 + X / 2, two
-; pixels to the byte.
-; -----------------------------------------------------------------------------
-BandVramAddr:
-    ld      l, e
-    ld      h, 0
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    ld      a, d
-    srl     a
-    ld      c, a
-    ld      b, 0
-    add     hl, bc
-    ld      (BandAddr), hl
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawPattern paints one eight-line glyph from the pattern bytes at HL instead
-; of from the font, expanded through the same glyph table.
-;
-;   in  HL = eight pattern bytes, D = X (even), E = Y
-;
-; The scroll arrows need it. The bundled font has no arrow glyphs at all, and
-; its 0x5E is a dither pattern rather than a caret -- which is exactly what the
-; up arrow came out as on screen.
-; -----------------------------------------------------------------------------
-DrawPattern:
-    push    hl
-    call    BandVramAddr
-    pop     hl
-
-    ld      c, 8                    ; pixel lines left
-.lineLoop:
-    di
-    push    hl
-    ld      hl, (BandAddr)
-    call    SetVramWrite
-    pop     hl
-
-    ld      a, (hl)
-    inc     hl
-    push    hl
-
-    ; Its four VRAM bytes: BandTable + pattern * 4, as in DrawBand.
-    ld      l, a
-    ld      h, 0
-    add     hl, hl
-    add     hl, hl
-    ld      de, (BandTable)
-    add     hl, de
-
-    ld      a, (hl)
-    out     (VDP_DATA), a
-    inc     hl
-    ld      a, (hl)
-    out     (VDP_DATA), a
-    inc     hl
-    ld      a, (hl)
-    out     (VDP_DATA), a
-    inc     hl
-    ld      a, (hl)
-    out     (VDP_DATA), a
-    ei
-
-    ld      hl, (BandAddr)
-    ld      de, 128                 ; one pixel line
-    add     hl, de
-    ld      (BandAddr), hl
-
-    pop     hl
-    dec     c
-    jr      nz, .lineLoop
-    ret
-
-; -----------------------------------------------------------------------------
-; HiliteRow flips the highlight on the row at list position HL.
-;
-; The row holds only two colours, 4 for the background and 15 for the text, and
-; 4 xor 11 = 15 while 15 xor 11 = 4. So one LMMV fill with the logical XOR
-; operation and a mask of 11 swaps them across the row: the highlight appears or
-; disappears without a single character being redrawn. At roughly a millisecond
-; per row that is the difference between a cursor that moves and one that crawls
-; -- the glyph renderer costs about 1.8 ms per character cell.
-;
-; Being its own inverse is what lets MoveTo flip the old row off and the new row
-; on without knowing which is which.
-; -----------------------------------------------------------------------------
-HiliteRow:
-    call    RowY
-    ret     c                       ; not inside the window
-    ld      (HiliteCmd + 2), a      ; DY low byte
-    xor     a
-    ld      (HiliteCmd + 3), a      ; DY high byte
-
-    di
-    ld      hl, HiliteCmd
-    call    DrawBoxVDP
-    call    WaitVDP
-    ei
-    ret
-
-; -----------------------------------------------------------------------------
-; ShiftList moves the window one row with a single VDP block move.
-;   in  A = 0: contents move up (the window scrolled down), last row vacated
-;       A = 1: contents move down (the window scrolled up), first row vacated
-;
-; The vacated row still holds the old pixels; the caller draws over it. HMMM is
-; the byte-oriented move, so the whole window costs about 20 ms against the half
-; second that repainting eleven rows would take.
-; -----------------------------------------------------------------------------
-ShiftList:
-    ; One row per block move, in an order where no move's source overlaps its
-    ; own destination -- so the engine's direction bits do not matter and this
-    ; does not rest on which bit of the argument byte is DIY. Guessing that bit
-    ; wrong is what corrupted the screen when the list scrolled up: the copy ran
-    ; forward over its own source and smeared one row down the window.
-    ;
-    ; Eleven moves of a single row cost what one move of eleven rows costs; the
-    ; engine is paid by the byte.
-    or      a
-    jr      nz, .downward
-
-    ; Contents move up: row 1 goes to row 0, row 2 to row 1, and so on. Each
-    ; source is still untouched when it is read.
-    ld      b, LIST_ROWS - 1
-    ld      hl, LIST_Y0             ; destination of the first move
-.upLoop:
-    push    bc
-    ld      a, l
-    ld      (ShiftCmd + 6), a       ; DY low; DX is fixed in the template
-    ld      a, h
-    ld      (ShiftCmd + 7), a
-    ld      bc, LIST_PITCH
-    add     hl, bc
-    ld      a, l
-    ld      (ShiftCmd + 2), a       ; SY = DY + one row
-    ld      a, h
-    ld      (ShiftCmd + 3), a
-    call    SendShift
-    pop     bc
-    djnz    .upLoop
-    ret
-
-.downward:
-    ; Contents move down: row 10 goes to row 11 first, then 9 to 10, so again
-    ; nothing is read after being written.
-    ld      b, LIST_ROWS - 1
-    ld      hl, LIST_Y0 + (LIST_ROWS - 2) * LIST_PITCH   ; last source row
-.downLoop:
-    push    bc
-    ld      a, l
-    ld      (ShiftCmd + 2), a       ; SY
-    ld      a, h
-    ld      (ShiftCmd + 3), a
-    ld      bc, LIST_PITCH
-    add     hl, bc
-    ld      a, l
-    ld      (ShiftCmd + 6), a       ; DY = SY + one row
-    ld      a, h
-    ld      (ShiftCmd + 7), a
-    ld      bc, -2 * LIST_PITCH
-    add     hl, bc                  ; next source, one row up
-    call    SendShift
-    pop     bc
-    djnz    .downLoop
-    ret
-
-; -----------------------------------------------------------------------------
-; SendShift hands ShiftCmd to the VDP: fifteen bytes from R#32, because a block
-; move needs a source rectangle, which the fills written from R#36 do not have.
-; -----------------------------------------------------------------------------
-SendShift:
-    ; HL and BC belong to the caller's loop, and otir walks HL to the end of the
-    ; block while counting B down. Losing HL here is what made every move after
-    ; the first one aim at ShiftCmd's own address instead of a screen row: one
-    ; row shifted and the rest landed as scattered dots.
-    push    hl
-    push    bc
-
-    di
-    call    WaitVDP
-
-    ld      a, 32
-    out     (VDP_CTRL), a
-    ld      a, $91
-    out     (VDP_CTRL), a
-    ld      c, VDP_INDIRECT
-    ld      b, 15
-    ld      hl, ShiftCmd
-    otir
-
-    call    WaitVDP
-    ei
-
-    pop     bc
-    pop     hl
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawRow paints one row: the entry at list position HL, or a blank row when the
-; position is past the end of the list. Positions outside the visible window are
-; ignored, so callers need not check.
-;
-; This is the unit both the full redraw and a cursor step go through, which is
-; what keeps a moved cursor looking exactly like a redrawn list.
-; -----------------------------------------------------------------------------
-; -----------------------------------------------------------------------------
-; RowY turns a list position in HL into the screen Y of its row.
-;   out  A = Y with carry clear; carry set when the position is not in the
-;        window. HL is preserved.
-; -----------------------------------------------------------------------------
-RowY:
-    push    hl
-    ld      de, (ScrollTop)
-    or      a
-    sbc     hl, de
-    jr      c, .outside
-    ld      de, LIST_ROWS
-    call    CmpHLDE
-    jr      nc, .outside
-
-    ; Y = LIST_Y0 + row * LIST_PITCH. L is 0..LIST_ROWS-1 here, and the loop is
-    ; skipped for row 0 rather than letting djnz wrap 256 times.
-    ld      a, LIST_Y0
-    ld      b, l
-    inc     b
-    dec     b
-    jr      z, .done
-.addPitch:
-    add     a, LIST_PITCH
-    djnz    .addPitch
-.done:
-    pop     hl
-    or      a                       ; carry clear: visible
-    ret
-
-.outside:
-    pop     hl
-    scf
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawRow paints the text of one row: the entry at list position HL, or a blank
-; row when the position is past the end of the list. Positions outside the
-; window are ignored, so callers need not check.
-;
-; Always in normal colours. The selection is a separate XOR pass, which is what
-; makes moving it free of glyph work.
-; -----------------------------------------------------------------------------
-DrawRow:
-    call    RowY
-    ret     c
-    ld      (CurY), a
-
-    push    hl
-
-    ; Past the end of the list: blank the row so a shorter directory cannot
-    ; leave the previous one's names on screen.
-    ld      de, (EntryCount)
-    call    CmpHLDE
-    jr      nc, .blank
-
-    ; Build the whole row as one string, then put it out as a single band: the
-    ; marker, the name, and spaces to the end so that whatever was there before
-    ; is erased.
-    call    ClearRowBuf
-
-    pop     hl
-    push    hl
-    ld      b, h
-    ld      c, l
-    call    SortedEntryAddr
-    push    hl
-
-    ; A directory is marked and painted from the grey table; a file is white.
-    ld      a, (hl)
-    or      a
-    ld      hl, MsgDirMark
-    ld      de, GlyphTableDir
-    jr      nz, .haveMark
-    ld      hl, MsgFileMark
-    ld      de, GlyphTable
-.haveMark:
-    ld      (BandTable), de
-    ld      de, RowBuf
-    call    CopyToRowBuf
-
-    pop     hl
-    call    EntryDispStr
-    ld      de, RowBuf + 4
-    ld      b, LIST_WIDTH - 4       ; the row is fixed width; a longer name is
-    call    CopyToRowBufN           ; shown cut, not allowed to run off the end
-    jr      .paint
-
-.blank:
-    call    ClearRowBuf
-    ld      hl, GlyphTable
-    ld      (BandTable), hl
-
-.paint:
-    ld      hl, RowBuf
-    ld      d, LIST_X
-    ld      a, (CurY)
-    ld      e, a
-    ld      b, LIST_WIDTH
-    call    DrawBand
-
-    di
-    xor     a
-    out     (VDP_CTRL), a
-    ld      a, $8E
-    out     (VDP_CTRL), a
-    ei
-    pop     hl
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawScrollHints paints the two arrows in their own column: up beside the first
-; row when the list continues above the window, down beside the last when it
-; continues below, a space where it does not.
-;
-; Two characters, so it is affordable after every scroll -- which is necessary,
-; because the column is outside the shifted rectangle and therefore never moves
-; by itself.
-; -----------------------------------------------------------------------------
-DrawScrollHints:
-    ld      hl, GlyphTable
-    ld      (BandTable), hl
-
-    ; Above: anything scrolled off the top?
-    ld      hl, (ScrollTop)
-    ld      a, h
-    or      l
-    ld      hl, PatBlank
-    jr      z, .haveUp
-    ld      hl, PatArrowUp
-.haveUp:
-    ld      d, HINT_X
-    ld      e, LIST_Y0
-    call    DrawPattern
-
-    ; Below: anything past the last visible row?
-    ld      hl, (ScrollTop)
-    ld      de, LIST_ROWS
-    add     hl, de
-    ld      de, (EntryCount)
-    call    CmpHLDE
-    ld      hl, PatBlank
-    jr      nc, .haveDown
-    ld      hl, PatArrowDown
-.haveDown:
-    ld      d, HINT_X
-    ld      e, LIST_Y0 + (LIST_ROWS - 1) * LIST_PITCH
-    call    DrawPattern
-    ret
-
-; -----------------------------------------------------------------------------
-; ClearRowBuf fills the row with spaces and terminates it.
-; CopyToRowBuf copies a string into it without the terminator, so the spaces
-; after it survive as padding.
-; -----------------------------------------------------------------------------
 ClearRowBuf:
     ld      hl, RowBuf
     ld      b, LIST_WIDTH
@@ -2426,21 +2151,44 @@ CopyToRowBuf:
     jr      CopyToRowBuf
 
 ; The same, but it stops after B characters: a name longer than its column is
-; shown cut rather than written over the rest of the row. It also stops at a CR
-; or an LF, because a label is a pointer into the ini buffer and ends where its
-; line does -- there is no NUL after it.
+; shown cut rather than written over the rest of the row. C is nonzero for
+; INI labels, which stop at CR/LF; filenames stop only at NUL.
 CopyToRowBufN:
     ld      a, (hl)
+    IFDEF ROM_DATABASE_MENU
+    cp      '['
+    call    z, SkipMapperTag
+    ENDIF
     or      a
     ret     z
+    push    af
+    ld      a, c
+    or      a
+    jr      z, .filename
+    pop     af
     cp      13
     ret     z
     cp      10
     ret     z
+    jr      .printable
+.filename:
+    pop     af
+.printable:
+    call    PrintableChar
     ld      (de), a
     inc     hl
     inc     de
     djnz    CopyToRowBufN
+    ret
+
+; Restrict display to the font's printable ASCII range; source bytes stay intact.
+PrintableChar:
+    cp      32
+    jr      c, .replace
+    cp      127
+    ret     c
+.replace:
+    ld      a, '?'
     ret
 
 ; -----------------------------------------------------------------------------
@@ -2463,7 +2211,11 @@ DrawList:
     ld      hl, (EntryCount)
     ld      a, h
     or      l
+    IFDEF AUTO_LOADER
+    jp      z, DrawScrollHints
+    ELSE
     ret     z
+    ENDIF
     ld      hl, (SelIndex)
     call    HiliteRow
     jp      DrawScrollHints
@@ -2476,205 +2228,23 @@ DrawList:
 ; Redrawn only when the digit changes, so this costs one comparison on 49 frames
 ; out of 50.
 ; -----------------------------------------------------------------------------
-DrawCountdown:
-    ; Off, or nothing to boot: blank the field once and leave it alone.
-    ld      a, (CountdownStop)
-    or      a
-    jr      nz, .blank
-    ld      a, (AutoBoot)
-    or      a
-    jr      z, .blank
-
-    ; Seconds = frames / 50, rounded up so the last second is visible.
-    ld      hl, (CfgDelay)
-    ld      c, 0
-.secs:
-    ld      a, h
-    or      l
-    jr      z, .haveSecs
-    inc     c
-    ld      de, 50
-    or      a
-    sbc     hl, de
-    jr      nc, .secs
-.haveSecs:
-    ld      a, (LastSecs)
-    cp      c
-    ret     z                       ; same digit: nothing to redraw
-    ld      a, c
-    ld      (LastSecs), a
-
-    ld      h, 0
-    ld      l, c
-    ld      de, CountStr
-    call    AppendNumber
-    ld      a, 's'
-    ld      (de), a
-    inc     de
-    xor     a
-    ld      (de), a
-    ld      hl, CountStr
-    jr      .show
-
-.blank:
-    ld      a, (LastSecs)
-    cp      $FF
-    ret     z                       ; already blank
-    ld      a, $FF
-    ld      (LastSecs), a
-    ld      hl, MsgEmpty
-
-.show:
-    di
-    ld      a, 10
-    ld      (TextColor), a
-    ld      a, 4
-    ld      (TextBgColor), a
-    ld      d, COUNT_X
-    ld      e, FOOTER_Y
-    ld      b, 4
-    call    DrawStringPadded
-    xor     a
-    out     (VDP_CTRL), a
-    ld      a, $8E
-    out     (VDP_CTRL), a
-    ei
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawFooter: the key hints, or the reason the list is not what the directory
-; holds.
-; -----------------------------------------------------------------------------
-; -----------------------------------------------------------------------------
-; Interrupts OFF around anything that writes the VDP. vdp.inc says so in its
-; header -- "the callers keep them disabled around rendering" -- and this routine
-; did not, which is where the random yellow dots came from.
-;
-; A VRAM write address is two bytes to port 0x99. The BIOS interrupt handler
-; writes that port too, to select the status register it reads; an interrupt
-; landing between our two bytes leaves the VDP pairing them with the handler's,
-; so the address is never set and the glyph bytes that follow go wherever the
-; address counter happened to be. One interrupt, one line of a character
-; scattered across VRAM -- in this routine's colour, which is why the dots were
-; yellow rather than white.
-;
-; DrawBand and DrawPattern hold the line themselves, per pixel line, so their
-; callers need nothing. Everything that goes through vdp.inc's renderers or its
-; command-block writer needs this.
-; -----------------------------------------------------------------------------
-DrawFooter:
-    di
-    ld      a, COLOR_FOOTER
-    ld      (TextColor), a
-    ld      a, COLOR_BG
-    ld      (TextBgColor), a
-
-    ld      a, (DirError)
-    or      a
-    ld      hl, MsgDirError
-    jr      nz, .haveMsg
-
-    ld      a, (EntryCapped)
-    or      a
-    ld      hl, MsgKeys
-    jr      z, .haveMsg
-    ld      hl, MsgCapped
-
-.haveMsg:
-    ld      d, 16
-    ld      e, FOOTER_Y
-    call    DrawString8x8
-    ei
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawDisk2 shows what is in drive B, on the footer line and in the footer's own
-; colour. Without it the only evidence of an assignment is in the ini file.
-;
-; It stays until the footer is drawn again, which is the next listing: the
-; assignment is a thing you do and then carry on browsing.
-; -----------------------------------------------------------------------------
-DrawDisk2:
-    di
-    ld      a, COLOR_FOOTER
-    ld      (TextColor), a
-    ld      a, COLOR_BG
-    ld      (TextBgColor), a
-
-    ld      hl, RowBuf
-    ld      (hl), 'B'
-    inc     hl
-    ld      (hl), ':'
-    inc     hl
-    ex      de, hl                  ; DE -> where the name goes
-
-    ld      a, (Disk2Path)
-    or      a
-    ld      hl, MsgNoDisk2
-    jr      z, .haveText
-    ld      hl, Disk2Path
-.haveText:
-    ld      b, FOOTER_CHARS - 2     ; the line is fixed width, and RowBuf is not
-    call    StrCopyN                ; long enough for a whole path either
-
-    ld      hl, RowBuf
-    ld      d, LIST_X
-    ld      e, FOOTER_Y
-    ld      b, FOOTER_CHARS
-    call    DrawStringPadded
-
-    xor     a
-    out     (VDP_CTRL), a
-    ld      a, $8E
-    out     (VDP_CTRL), a
-    ei
-    ret
-
-; -----------------------------------------------------------------------------
-; DrawReading / ClearReading bracket the one operation slow enough to notice.
-; -----------------------------------------------------------------------------
-DrawReading:
-    di
-    ld      a, 15
-    ld      (TextColor), a
-    ld      a, 4
-    ld      (TextBgColor), a
-    ld      hl, MsgReading
-    ld      d, LIST_X
-    ld      e, LIST_Y0
-    ld      b, LIST_WIDTH
-    call    DrawStringPadded
-    xor     a
-    out     (VDP_CTRL), a
-    ld      a, $8E
-    out     (VDP_CTRL), a
-    ei
-    ret
-
-ClearReading:
-    ret                             ; DrawList overwrites the row
-
-; =============================================================================
-; INI
-; =============================================================================
-
-; -----------------------------------------------------------------------------
-; InitHiliteCmd fills the fixed half of the highlight's VDP block: the rectangle
-; spans a row of the list, the mask swaps 4 and 15, and the command is a logical
-; fill with XOR. Only DY changes per call, which HiliteRow patches.
-; -----------------------------------------------------------------------------
-InitHiliteCmd:
-    ld      hl, HiliteTemplate
-    ld      de, HiliteCmd
-    ld      bc, 11
-    ldir
-    ld      hl, ShiftTemplate
-    ld      de, ShiftCmd
-    ld      bc, 15
-    ldir
-    ret
+    IFNDEF AUTO_LOADER
+    INCLUDE "graphic_status.inc"
+    ENDIF
 
 ClearConfig:
+    IFDEF ROM_DATABASE_MENU
+    call    InitRomDatabase
+    ENDIF
+    ld      a, 1
+    ld      (CfgMultidisk), a
+    IFDEF AUTO_LOADER
+    ld      a, 100
+    ld      (CfgSccVolume), a
+    xor     a
+    ld      (VolumeFrames), a
+    ld      (VolumeDirty), a
+    ENDIF
     ; CurPath first: DrawFrame shows it before the ini has been read.
     ld      hl, CurPath
     ld      (hl), '/'
@@ -2683,17 +2253,31 @@ ClearConfig:
 
     xor     a
     ld      (DiskRomName), a
+    ld      (NextorRomName), a
+    ld      (NextorInvalid), a
     ld      (Disk2Path), a
     ld      (LastPath), a
     ld      (CfgSccOnExit), a
     ld      (CountdownStop), a
     ld      (AutoBoot), a
     ld      (SelectedType), a
+    ld      (HelpActive), a
+    ld      (HelpF1Held), a
+    IFDEF AUTO_LOADER
+    ld      (RbscProgress), a
+    ld      (DiskStatusVisible), a
+    ENDIF
 
     ld      a, $FF
     ld      (LastSecs), a           ; nothing drawn yet, so the first call draws
 
-    ld      hl, 500
+    ld      a, 15
+    ld      (CfgColorDir), a
+    ld      a, 10
+    ld      (CfgColorRom), a
+    ld      a, 7
+    ld      (CfgColorDsk), a
+    ld      hl, 5000
     ld      (CfgDelayMs), hl
     ld      (CfgDelay), hl
     ret
@@ -2715,50 +2299,78 @@ ParseIni:
     ret     z
 
     cp      ' '
-    jr      z, .skipChar
+    jp      z, .skipChar
     cp      9
-    jr      z, .skipChar
+    jp      z, .skipChar
     cp      13
-    jr      z, .skipChar
+    jp      z, .skipChar
     cp      10
-    jr      z, .skipChar
-    jr      .checkKey
+    jp      z, .skipChar
+    jp      .checkKey
 
 .skipChar:
     inc     hl
-    jr      .nextLine
+    jp      .nextLine
 
 .checkKey:
+    IFDEF ROM_DATABASE_MENU
+    cp      'k'
+    jr      nz, .notKucOptions
+    call    ParseKucOptionsLine
+    jp      .skipToEOL
+.notKucOptions:
+    cp      'r'
+    jr      nz, .notRomDatabase
+    call    ParseRomDatabaseLine
+    jp      .skipToEOL
+.notRomDatabase:
+    ENDIF
     cp      ';'
-    jr      z, .skipToEOL
+    jp      z, .skipToEOL
     cp      '#'
-    jr      z, .skipToEOL
+    jp      z, .skipToEOL
     cp      '['
-    jr      z, .skipToEOL
+    jp      z, .skipToEOL
 
     ; Dispatch on the first letter, then on enough of the rest to disambiguate:
-    ; last, disk2 / diskrom / delay, scc_on_exit.
+    ; last, disk2 / diskrom / delay, colors, scc_on_exit.
+    cp      'm'
+    jr      nz, .notMultidisk
+    call    ParseMultidiskLine
+    jp      .skipToEOL
+.notMultidisk:
+    cp      'c'
+    jp      nz, .notColor
+    call    ParseColorLine
+    jp      .skipToEOL
+.notColor:
+    cp      'n'
+    jp      z, .keyNextor
     cp      'l'
-    jr      z, .keyLast
+    jp      z, .keyLast
     cp      'd'
-    jr      z, .keyD
+    jp      z, .keyD
     cp      's'
-    jr      z, .keyScc
-    jr      .skipToEOL
+    jp      z, .keyScc
+    jp      .skipToEOL
+
+.keyNextor:
+    call    ParseNextorLine
+    jp      .skipToEOL
 
 .keyLast:
     ld      de, LastPath
     ld      b, PATH_MAX
-    jr      .copyValue
+    jp      .copyValue
 
 .keyD:
     inc     hl
     ld      a, (hl)
     dec     hl
     cp      'e'
-    jr      z, .keyDelay
+    jp      z, .keyDelay
     cp      'i'
-    jr      nz, .skipToEOL
+    jp      nz, .skipToEOL
 
     ; disk2 or diskrom: the fifth character tells them apart.
     push    hl
@@ -2769,34 +2381,55 @@ ParseIni:
     ld      a, (hl)
     pop     hl
     cp      '2'
-    jr      z, .keyDisk2
+    jp      z, .keyDisk2
     ld      de, DiskRomName
     ld      b, DISKROM_NAME_MAX
-    jr      .copyValue
+    jp      .copyValue
 
 .keyDisk2:
     ld      de, Disk2Path
     ld      b, PATH_MAX
-    jr      .copyValue
+    jp      .copyValue
 
 .keyDelay:
     call    FindValue
-    jr      c, .skipToEOL
+    jp      c, .skipToEOL
     call    ParseNumber             ; DE = value, HL past it
     ld      (CfgDelayMs), de        ; milliseconds; Init makes the frame count
-    jr      .skipToEOL
+    jp      .skipToEOL
 
 .keyScc:
+    IFDEF AUTO_LOADER
+    call    ParseSccVolumeLine
+    jp      c, .skipToEOL
+    ; A typo in the volume key must not become an scc_on_exit setting.
+    push    hl
+    ld      de, StrKeyScc
+.sccKey:
+    ld      a, (de)
+    or      a
+    jr      z, .sccKeyFound
+    cp      (hl)
+    jr      nz, .sccKeyOther
+    inc     hl
+    inc     de
+    jr      .sccKey
+.sccKeyOther:
+    pop     hl
+    jp      .skipToEOL
+.sccKeyFound:
+    pop     hl
+    ENDIF
     call    FindValue
-    jr      c, .skipToEOL
+    jp      c, .skipToEOL
     call    ParseNumber
     ld      a, e
     or      d
-    jr      z, .sccZero
+    jp      z, .sccZero
     ld      a, 1
 .sccZero:
     ld      (CfgSccOnExit), a
-    jr      .skipToEOL
+    jp      .skipToEOL
 
 .copyValue:
     ; DE = destination, B = its capacity. HL is left past the value.
@@ -2805,7 +2438,7 @@ ParseIni:
     call    FindValue
     pop     bc
     pop     de
-    jr      c, .skipToEOL
+    jp      c, .skipToEOL
     call    CopyValue
 
 .skipToEOL:
@@ -2817,7 +2450,66 @@ ParseIni:
     jp      z, .nextLine    ; jp: the key handlers above
     cp      10             ; are past jr's reach
     jp      z, .nextLine
-    jr      .skipToEOL
+    jp      .skipToEOL
+
+; Parse only exact color keys and decimal values 0..15. Empty values keep defaults.
+ParseColorLine:
+    push    hl
+    ld      de, StrKeyColorDir
+    call    StrStartsNoCase
+    pop     hl
+    ld      bc, CfgColorDir
+    jr      z, .value
+    push    hl
+    ld      de, StrKeyColorRom
+    call    StrStartsNoCase
+    pop     hl
+    ld      bc, CfgColorRom
+    jr      z, .value
+    push    hl
+    ld      de, StrKeyColorDsk
+    call    StrStartsNoCase
+    pop     hl
+    ld      bc, CfgColorDsk
+    ret     nz
+.value:
+    push    bc
+    call    FindValue
+    pop     bc
+    ret     c
+    ld      a, (hl)
+    cp      '0'
+    ret     c
+    cp      '9' + 1
+    ret     nc
+    push    hl
+    inc     hl
+    ld      a, (hl)
+    cp      '0'
+    jr      c, .lengthOk
+    cp      '9' + 1
+    jr      nc, .lengthOk
+    inc     hl
+    ld      a, (hl)
+    cp      '0'
+    jr      c, .lengthOk
+    cp      '9' + 1
+    jr      nc, .lengthOk
+    pop     hl
+    ret
+.lengthOk:
+    pop     hl
+    push    bc
+    call    ParseNumber
+    pop     bc
+    ld      a, d
+    or      a
+    ret     nz
+    ld      a, e
+    cp      16
+    ret     nc
+    ld      (bc), a
+    ret
 
 ; -----------------------------------------------------------------------------
 ; FindValue advances HL past the '=' and any spaces after it. Carry set when the
@@ -2924,7 +2616,7 @@ ParseNumber:
 
 ; -----------------------------------------------------------------------------
 ; SaveIni rewrites /loader.ini from the parsed values, then hands the write to a
-; RAM stub. Canonical: five keys, no comments, and of the rest only the name=
+; RAM stub. Canonical: known keys, no comments, and of the rest only the name=
 ; lines survive. That is only safe because this loader is the only one on the
 ; volume.
 ;
@@ -2968,6 +2660,32 @@ SaveIni:
     call    AppendEOL
 
 .noDiskRom:
+    ld      a, (NextorRomName)
+    or      a
+    jr      z, .noNextor
+    ld      hl, NextorKey
+    call    AppendStr
+    ld      hl, NextorRomName
+    call    AppendStr
+    call    AppendEOL
+.noNextor:
+    IFDEF ROM_DATABASE_MENU
+    ld      a, (CfgKucOptions)
+    or      a
+    jr      z, .noKucOptions
+    ld      hl, KucOptionsKey
+    call    AppendStr
+    ld      a, '1'
+    ld      (de), a
+    inc     de
+    call    AppendEOL
+.noKucOptions:
+    ld      hl, RomDatabaseKey
+    call    AppendStr
+    ld      hl, RomDatabasePath
+    call    AppendStr
+    call    AppendEOL
+    ENDIF
     ld      a, (CfgSccOnExit)
     or      a
     jr      z, .noScc
@@ -2979,6 +2697,31 @@ SaveIni:
     call    AppendEOL
 
 .noScc:
+    IFDEF AUTO_LOADER
+    ld      hl, SccVolumeKey
+    call    AppendStr
+    ld      a, (CfgSccVolume)
+    ld      l, a
+    ld      h, 0
+    call    AppendNumber
+    call    AppendEOL
+    ENDIF
+    ld      hl, MultidiskKey
+    call    AppendStr
+    ld      a, (CfgMultidisk)
+    add     a, '0'
+    ld      (de), a
+    inc     de
+    call    AppendEOL
+    ld      hl, StrKeyColorDir
+    ld      a, (CfgColorDir)
+    call    AppendColor
+    ld      hl, StrKeyColorRom
+    ld      a, (CfgColorRom)
+    call    AppendColor
+    ld      hl, StrKeyColorDsk
+    ld      a, (CfgColorDsk)
+    call    AppendColor
     ; Length for CMD_WRITE_BLOCK.
     ld      hl, RAM_INI_BUF
     ex      de, hl
@@ -2992,6 +2735,15 @@ SaveIni:
     ldir
     call    SAFERAM
     ret
+
+AppendColor:
+    push    af
+    call    AppendStr
+    pop     af
+    ld      l, a
+    ld      h, 0
+    call    AppendNumber
+    jp      AppendEOL
 
 ; -----------------------------------------------------------------------------
 ; PreserveNameLines compacts the ini buffer down to its name= lines, so SaveIni
@@ -3382,8 +3134,21 @@ CmpHLDE:
 ; SHARED CODE
 ; =============================================================================
 
+    INCLUDE "joystick.inc"
     INCLUDE "mailbox.inc"
+    INCLUDE "disk_options.inc"
+    IFDEF AUTO_LOADER
+    INCLUDE "audio_options.inc"
+    INCLUDE "audio_controls.inc"
+    ENDIF
+    DEFINE EXPLORER_TEXT
+    IFNDEF AUTO_LOADER
     INCLUDE "vdp.inc"
+    ENDIF
+    IFDEF AUTO_LOADER
+    INCLUDE "auto_ui.inc"
+    INCLUDE "fw_help.inc"
+    ENDIF
 
 ; =============================================================================
 ; VDP BOX DESCRIPTORS
@@ -3403,15 +3168,22 @@ ShiftTemplate:
 
 CmdShadow:
     dw      10, 38, 236, 152        ; shadow (X, Y, W, H)
-    db      1, 0, $C0
+    db      $11, 0, $C0             ; HMMV uses a packed pair of pixels
 
 CmdBorder:
     dw      6, 34, 244, 154         ; white border
-    db      15, 0, $C0
+    db      $FF, 0, $C0
 
 CmdFill:
     dw      8, 36, 240, 150         ; blue window background
-    db      4, 0, $C0
+    db      $44, 0, $C0
+
+CmdHelpBorder:
+    dw      16, 40, 224, 144
+    db      $FF, 0, $C0
+CmdHelpFill:
+    dw      18, 42, 220, 140
+    db      $44, 0, $C0
 
 ; =============================================================================
 ; DATA
@@ -3420,6 +3192,11 @@ CmdFill:
 ; DX, DY, NX, NY, colour, argument, command -- the shape DrawBoxVDP sends from
 ; R#36. DY is patched per row; 11 is 4 xor 15, and $83 is a logical fill with
 ; the XOR operation.
+    INCLUDE "nextor/nextor_menu.inc"
+
+MOUNT_BROWSER EQU 1
+    INCLUDE "mount_errors.inc"
+
 HiliteTemplate:
     dw      LIST_X, 0
     dw      LIST_WIDTH * 8, 8
@@ -3429,9 +3206,16 @@ StrIniFile:     db "/loader.ini", 0
 StrIniFileEnd:
 
 StrLoaderRom:   db "loader.rom", 0
+    IFDEF HIDE_LITE_ROM
+StrLiteRom:     db "loader_lite.rom", 0
+    ENDIF
+StrDiskRom:     db "disk.rom", 0
 StrExtRom:      db ".ROM"
 StrExtDsk:      db ".DSK"
 
+StrKeyColorDir: db "color_dir=", 0
+StrKeyColorRom: db "color_rom=", 0
+StrKeyColorDsk: db "color_dsk=", 0
 StrKeyLast:     db "last=", 0
 StrKeyDisk2:    db "disk2=", 0
 StrKeyDelay:    db "delay=", 0
@@ -3446,23 +3230,204 @@ PatArrowUp:     db $18, $3C, $7E, $FF, $18, $18, $18, $00
 PatArrowDown:   db $18, $18, $18, $FF, $7E, $3C, $18, $00
 PatBlank:       db $00, $00, $00, $00, $00, $00, $00, $00
 
-MsgTitle:       db "OmniSCC", 0
-MsgKeys:        db "RET=open SPC=B: ESC=exit", 0
+MsgKeys:        db "[F1] Help * [RET] Open", 0
+    IFDEF AUTO_LOADER
+CreditsLines:
+    db "OmniSCC", 0
+CreditsVersionLine:
+    db " ", 0
+    db "Created by", 0
+    db "AlSp / RBSC / OSCP.club", 0
+    db " ", 0
+    db "Russian Bear Service Crew", 0
+    db " ", 0
+    db "MSX hardware", 0
+    db "with passion", 0
+    db " ", 0
+    db "F1 / Esc: Close", 0
+    db 0
+    ELSE
+CreditsLines EQU HelpLines
+    ENDIF
+HelpLines:
+    IFDEF AUTO_LOADER
+    db "Help", 0
+    db " ", 0
+    db "[RET/SPACE] Open / Start", 0
+    db "[ESC] Exit from menu", 0
+    db "[INS/DEL] B: set / eject", 0
+HelpVolumeLine:
+    db "[+/-] SCC volume", 0
+    db "[UP/DOWN] Select", 0
+    db "[LEFT/RIGHT] Flip pages", 0
+    db "[BS] Parent directory", 0
+    db "[JOY A] Open / Start", 0
+    db "[JOY B] Back / Exit", 0
+    db "[F1] This help screen", 0
+    db 0
+    ELSE
+    db "Help", 0
+    db " ", 0
+    db "[RET/SPACE] Open / boot", 0
+    db "[INS] B: set [DEL] eject", 0
+    db "[ESC] Exit to BASIC", 0
+    db "[BS] Parent directory", 0
+    db "[UP/DOWN] Select", 0
+    db "[LEFT/RIGHT] Page", 0
+    db "[F1] Help", 0
+    db "[JOY A] Open / boot", 0
+    db "[JOY B] Back / exit", 0
+    IFDEF AUTO_LOADER
+HelpVolumeLine:
+    db "[+/-] SCC volume", 0
+    ELSE
+    db " ", 0
+    ENDIF
+    IFDEF AUTO_LOADER
+    db "[ESC] Close", 0
+    ELSE
+    db "[ESC] / [F1] Close", 0
+    ENDIF
+    db 0
+    ENDIF
 MsgNoDisk2:     db "none", 0
 MsgCapped:      db "TRUNCATED  ESC=exit", 0
 MsgDirError:    db "CANNOT OPEN DIR", 0
 MsgReading:     db "Reading...", 0
-MsgDirMark:     db "[D]", 0
-MsgFileMark:    db " ", 0
+CornerTL:      db $1F, $3F, $60, $C0, $C0, $C0, $C0, $C0
+CornerTR:      db $F8, $FC, $06, $03, $03, $03, $03, $03
+CornerBL:      db $C0, $C0, $C0, $C0, $C0, $60, $3F, $1F
+CornerBR:      db $03, $03, $03, $03, $03, $06, $FC, $F8
+PatFolder:     db $00, $70, $7E, $42, $7E, $7E, $7E, $00
+MsgDirMark:     db 1, " ", 0
+MsgFileMark:    db "  ", 0
 MsgEmpty:       db " ", 0
 
-Font8x8:
-    INCLUDE "font.inc"
+; PrintableChar replaces control codes; omit those 32 unused glyphs while
+; retaining the renderer's Font8x8 + ASCII * 8 addressing.
+Font8x8 EQU $-32*8
+    IFNDEF AUTO_LOADER
+    INCLUDE "loader_font.inc"
+    ENDIF
 Font8x8End:
+
+    IFNDEF AUTO_LOADER
+    INCLUDE "loader_title.inc"
+    ENDIF
 
 ; =============================================================================
 ; ROM PADDING
 ; =============================================================================
 
+    IFDEF AUTO_LOADER
+    ; FindLabel uses this code while CMD_DIR_NEXT exposes the reply at
+    ; 6000h..7FFFh. Keep BOTH the matcher and its dictionary in lower ROM.
+    INCLUDE "mapper_tags.inc"
+    INCLUDE "rom_database.inc"
+    INCLUDE "kuc_options.inc"
+    INCLUDE "startup_screen.inc"
+LowerRomEnd:
+    ASSERT $ <= $6000
+    ORG $6000
+; Startup only: directory replies are closed before this upper-ROM code runs.
+; SortI/SortJ are free after sorting. Exact names win; a tag-free match must
+; be unique, matching firmware resolution of pre-database last= paths.
+RestoreLastSelection:
+    ld hl, LastPath
+    ld a, (hl)
+    or a
+    ret z
+    ld hl, 0
+    ld (SortI), hl
+    dec hl
+    ld (SortJ), hl                  ; FFFF=no candidate, FFFE=ambiguous
+.scan:
+    ld hl, (SortI)
+    ld de, (EntryCount)
+    call CmpHLDE
+    jr nc, .finished
+    ld b, h
+    ld c, l
+    call SortedEntryAddr
+    ld a, (hl)
+    or a
+    jr nz, .next                   ; files only, never directories or '..'
+    ld de, ENTRY_NAME
+    add hl, de
+    push hl
+    ld hl, LastPath
+    call BaseName
+    ex de, hl
+    pop hl
+    push hl
+    push de
+    call StrCmpNoCase
+    pop de
+    pop hl
+    jr z, .exact
+    call MatchLastTagged
+    jr nz, .next
+    ld hl, (SortJ)
+    inc hl
+    ld a, h
+    or l
+    ld hl, $FFFE
+    jr nz, .candidate
+    ld hl, (SortI)
+.candidate:
+    ld (SortJ), hl
+.next:
+    ld hl, (SortI)
+    inc hl
+    ld (SortI), hl
+    jr .scan
+.finished:
+    ld hl, (SortJ)
+    ld de, $FFFE
+    call CmpHLDE
+    ret nc
+    jr .select
+.exact:
+    ld hl, (SortI)
+.select:
+    ld (SelIndex), hl
+    jp ClampScroll
+
+; Case-insensitive filename comparison, skipping recognized mapper tags only.
+MatchLastTagged:
+    ld a, (hl)
+    cp '['
+    call z, SkipMapperTag
+    ex de, hl
+    ld a, (hl)
+    cp '['
+    call z, SkipMapperTag
+    ex de, hl
+    ld a, (hl)
+    call UpperCase
+    ld b, a
+    ld a, (de)
+    call UpperCase
+    cp b
+    ret nz
+    or a
+    ret z
+    inc hl
+    inc de
+    jr MatchLastTagged
+
+    INCLUDE "auto_renderers.inc"
+RbscDrawBox EQU GraphicUI.DrawBoxVDP
+RbscWaitVDP EQU GraphicUI.WaitVDP
+RbscSetWrite EQU GraphicUI.SetVramWrite
+    INCLUDE "rbsc_easter_egg.inc"
+UpperRomEnd:
+    ASSERT $ <= $7FFE
+    SIZE $4000
+    SAVEBIN "../generated/loader_auto.rom", $4000, $4000
+    ELSE
+    ASSERT  $ <= $6000
     SIZE    $2000
     SAVEBIN "../generated/loader.rom", $4000, $2000
+
+    ENDIF

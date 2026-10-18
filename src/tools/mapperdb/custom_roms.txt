@@ -1,0 +1,22 @@
+# Local ROM identities not present in the pinned openMSX database.
+# Format: complete SHA-1 (40 hexadecimal characters), then canonical mapper tag.
+# Optional third field: override (only to correct an existing upstream entry).
+# Keep complete hashes here: the generator checks 7-byte prefix collisions.
+
+# User-tested Pampas & Selene pampas_c.rom, 2 MiB; OmniSCC+.
+27903721ecfe941083f70ec21d563bb3fcf2f821 KUC
+
+# Additional user-tested Pampas & Selene variants; OmniSCC+.
+# pampas_e.rom
+0fed275fc5a5aa3a6b21524425febcf075b7a9ed KUC
+# pampas_m.rom
+b815c9b2a11a3680857c28a334002d0e4d576575 KUC
+
+# User-supplied prince.rom.
+f31aaa2873aedd58c6c52c8f65ae1cb0a7985791 ASCII16
+
+# User-supplied Sydney Hunter: fixed lower 16 KiB, banked upper window at 7000h.
+ec21ddc0e2a5a1e30ff3a3e872f19e91919508fe ASCII16
+
+# SCC+ conversion requires enhanced startup, not the upstream KonamiSCC type.
+9a5e3433c5d82f2166969162bb822a965c741ce5 SCCPlus override

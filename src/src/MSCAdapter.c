@@ -9,6 +9,7 @@
 #include "tusb.h"
 #include "FlashAdapter.h"
 #include "FSAdapter.h"
+#include "VolumeAccess.h"
 
 extern const struct lfs_config lfs_pico_flash_config;
 static bool ejected = false;
@@ -31,7 +32,7 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     (void)lun;
-    return true;
+    return volume_owner() == VOLUME_USB;
 }
 
 void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_size) {
@@ -64,9 +65,9 @@ extern uint8_t* const msc_sector_scratch;
 
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
     if (lba >= FAT_NUM_SECTORS) return -1;
-    if (offset + bufsize > FAT_SECTOR_SIZE) return -1;
+    if (offset > FAT_SECTOR_SIZE || bufsize > FAT_SECTOR_SIZE - offset) return -1;
 
-    if (_fs_read(msc_sector_scratch, lba, 1) != 0) return -1;
+    if (volume_read(VOLUME_USB, msc_sector_scratch, lba, 1) != 0) return -1;
 
     memcpy(buffer, msc_sector_scratch + offset, bufsize);
     return (int32_t) bufsize;
@@ -74,7 +75,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buff
 
 bool tud_msc_is_writable_cb (uint8_t lun) {
     (void) lun;
-    return true;
+    return volume_owner() == VOLUME_USB;
 }
 
 // Callback invoked when received WRITE10 command.
@@ -95,15 +96,15 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* 
     (void)offset;
 
     if (lba >= FAT_NUM_SECTORS) return -1;
-    if (offset + bufsize > FAT_SECTOR_SIZE) return -1;
+    if (offset > FAT_SECTOR_SIZE || bufsize > FAT_SECTOR_SIZE - offset) return -1;
 
     // read-modify-write for partial transfers
     if (offset != 0 || bufsize != FAT_SECTOR_SIZE) {
-        if (_fs_read(msc_sector_scratch, lba, 1) != 0) return -1;
+        if (volume_read(VOLUME_USB, msc_sector_scratch, lba, 1) != 0) return -1;
         memcpy(msc_sector_scratch + offset, buffer, bufsize);
-        if (_fs_write(msc_sector_scratch, lba, 1) != 0) return -1;
+        if (volume_write(VOLUME_USB, msc_sector_scratch, lba, 1) != 0) return -1;
     } else {
-        if (_fs_write(buffer, lba, 1) != 0) return -1;
+        if (volume_write(VOLUME_USB, buffer, lba, 1) != 0) return -1;
     }
 
     // deferred sync

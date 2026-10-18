@@ -1,0 +1,4 @@
+# Release payload checksums must survive checkout on every host platform.
+firmware/*.uf2 -text
+tools/* -text
+SHA256SUMS text eol=lf

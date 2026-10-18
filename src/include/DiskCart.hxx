@@ -29,6 +29,9 @@
 #define DISK_P_DRIVE   0x1E04
 #define DISK_P_FLAGS   0x1E05
 
+// Numbered image selection: P_DRIVE = 0, P_COUNT = disk number 1..9.
+#define DISK_CMD_SELECT 0x44
+
 // Handshake for CMD_DISK_SETRAM. The INIT tail writes these two bytes into the
 // parameter block immediately before the command; CmdDiskSetRam refuses a 0x35
 // that arrives without them and clears them once used.
@@ -52,16 +55,16 @@
 
 // Longest name CMD_BASIC_DIR_NEXT sends as the entry's long name. An entry
 // whose long name is longer goes out as its 8.3 alias instead, so that what
-// CALL DIR prints is always the whole of a name that CALL MOUNT will open.
+// CALL ODIR prints is always the whole of a name that CALL OMOUNT will open.
 // The shape of the rule is the loader's -- AcceptEntry in loader.asm keeps the
 // long name when it fits the browser's row and takes the alias otherwise --
 // but the threshold is not: the browser's NAME_MAX is 31, and this is 32
-// because that is CALL DIR's field -- six columns of "<DIR> " and 32 of name
+// because that is CALL ODIR's field -- six columns of "<DIR> " and 32 of name
 // are the 38-column line the two-column listing already fit within, inside
 // SCREEN 0's line at its 39-column default as well as at WIDTH 40. The
 // driver's field is DIR_NAME_MAX in diskstub.asm, which must be this same
 // figure; test_constants.py checks the two stay in step. What reaches this
-// limit is already filtered to what CALL MOUNT can open -- a directory or a
+// limit is already filtered to what CALL OMOUNT can open -- a directory or a
 // .dsk image -- so trimming to this width never has to consider anything else.
 #define DISK_DIR_NAME_MAX 32
 
@@ -246,7 +249,7 @@ private:
 
     uint8_t last_cmd_result;
 
-    // CALL DIR's directory, open between CMD_BASIC_DIR_OPEN and the step that
+    // CALL ODIR's directory, open between CMD_BASIC_DIR_OPEN and the step that
     // walks off the end of it. It has to outlive a command because a listing is
     // one round trip per entry, and it is the only state in this class that
     // does -- everything else a command needs is in the exchange buffer when
@@ -277,6 +280,7 @@ private:
     void CmdDiskFlush();
     void CmdDiskFormat();
     void CmdDiskStatus();
+    void CmdDiskSelect();
     void CmdDiskSetRam();
     void CmdDiskUnborrow();
     CDiskFiles& _files;

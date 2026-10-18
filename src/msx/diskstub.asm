@@ -33,6 +33,11 @@ STUB_PART       EQU 0
     ENDIF
 
 ; --- MSX system variables and BIOS entries (constants, never relocated) ------
+MEMSIZ          EQU $F672       ; end of BASIC string space
+STKTOP          EQU $F674       ; saved BASIC stack top, used by boot sectors
+SAVSTK          EQU $F6B1       ; valid saved stack bottom
+FILTAB          EQU $F860       ; BASIC FCB pointer table
+NULBUF          EQU $F862       ; system file buffer
 HIMEM           EQU $FC4A       ; top of free RAM
 CART_BUF        EQU $6000       ; cartridge exchange buffer
 CART_CMD        EQU $7FFF       ; cartridge command register / ready flag
@@ -56,7 +61,7 @@ PROCNM          EQU $FD89
 CHPUT           EQU $00A2
 
 ; Read one row of the keyboard matrix: A = row in, the row's keys out, a zero
-; bit per key held down. CALL DIR's paging pause is what uses it.
+; bit per key held down. CALL ODIR's paging pause is what uses it.
 ;
 ; SNSMAT and not CHGET, which is the obvious way to wait for a key and is the
 ; wrong one here: CHGET reads the buffer the VDP interrupt fills, this handler
@@ -99,6 +104,7 @@ CMD_DISK_STATUS EQU $33
 CMD_DISK_FLUSH  EQU $34
 CMD_DISK_SETRAM EQU $35
 CMD_DISK_FORMAT EQU $39
+CMD_DISK_SELECT EQU $44
 
 ; CMD_DISK_WRITE and CMD_DISK_FLUSH are the two commands the firmware may not
 ; serve with /WAIT held, and they are issued through MailCmd in the trampoline
@@ -124,7 +130,7 @@ ST_WRPROT       EQU $0A
 ST_NOTREADY     EQU $02
 
 ; The path named no file the volume could open. Its own status because it is
-; the one outcome of CALL MOUNT a user can do something about -- a typo in a
+; the one outcome of CALL OMOUNT a user can do something about -- a typo in a
 ; name -- and the statement says so in as many words. DISK_ST_NOFILE in
 ; DiskCart.hxx must agree, which test_constants.py checks.
 ST_NOFILE       EQU $06
@@ -149,8 +155,8 @@ ST_TIMEOUT      EQU $0C
 ; second on a 3.58 MHz Z80 and half that on a turbo machine.
 ;
 ; The commands this poll waits for are the three that touch flash -- write,
-; flush, format -- and the two that open or close a file, CALL MOUNT and CALL
-; EJECT. The slowest is a format: a dozen sector programs and the erases
+; flush, format -- and the two that open or close a file, CALL OMOUNT and CALL
+; OEJECT. The slowest is a format: a dozen sector programs and the erases
 ; the log-structured allocator does every eighth page, which is a second or two
 ; even on a slow part. Ten passes is several times that, which is the point: a
 ; bound that fires on healthy work would be worse than no bound.
@@ -177,7 +183,7 @@ CMD_DISK_WINDOW_OFF EQU $38
 ; number to that case.
 CMD_BASIC_WINDOW_OFF EQU $3A
 
-; CALL MOUNT and CALL EJECT. Both are file I/O on the firmware's side --
+; CALL OMOUNT and CALL OEJECT. Both are file I/O on the firmware's side --
 ; Mount() opens a file and builds a CLMT, Unmount() closes one and may flush it
 ; -- so like the three flash commands they are answered with /WAIT released and
 ; polled for through MailCmd from MSX RAM, never from a window. See
@@ -189,7 +195,7 @@ CMD_BASIC_WINDOW_OFF EQU $3A
 CMD_BASIC_MOUNT EQU $3B
 CMD_BASIC_EJECT EQU $3C
 
-; CALL DIR, which is a pair because a listing is an unbounded number of round
+; CALL ODIR, which is a pair because a listing is an unbounded number of round
 ; trips: 0x3D opens a directory on the cartridge's own FAT volume and 0x3E
 ; steps it, one entry per command, until the firmware answers ST_ENDDIR. The
 ; handle lives between them on the firmware's side, which is what makes them a
@@ -208,7 +214,7 @@ CMD_BASIC_EJECT EQU $3C
 CMD_BASIC_DIR_OPEN EQU $3D
 CMD_BASIC_DIR_NEXT EQU $3E
 
-; CALL DISK. Unlike the two above this one opens nothing: it reads four
+; CALL ODISK. Unlike the two above this one opens nothing: it reads four
 ; accessors off the two CDiskImages the cartridge already holds, so it is
 ; answered on the fast path with /WAIT still asserted, like CMD_DISK_STATUS.
 ; It is still issued through MailCmd rather than a poll of this blob's own --
@@ -235,7 +241,7 @@ ST_FILE_MORE   EQU $10
 ; The parser refuses the statement instead.
 BAS_PATH_MAX    EQU 64
 
-; CALL DIR's line, in characters: a marker field that holds "<DIR> " or the
+; CALL ODIR's line, in characters: a marker field that holds "<DIR> " or the
 ; same width in blanks, then the name, cut at DIR_NAME_MAX. One entry to a
 ; line, 38 characters at most, which fits SCREEN 0's 40-column line.
 ;
@@ -243,7 +249,7 @@ BAS_PATH_MAX    EQU 64
 ; it is at most this long and the 8.3 alias when it is not -- the rule the
 ; loader's browser applies to its own listing -- so on the cartridge nothing
 ; that arrives is ever cut, and what is printed can always be typed back into
-; CALL MOUNT. The cut exists for the emulator, which has no alias to fall back
+; CALL OMOUNT. The cut exists for the emulator, which has no alias to fall back
 ; to and sends the long name whatever its length. DISK_DIR_NAME_MAX in
 ; DiskCart.hxx is the firmware's side of the rule; test_constants.py ties the
 ; two together.
@@ -342,7 +348,7 @@ SAFERAM_INIT    EQU $C800
 ; CmdDiskSetRam leaves the blob already relocated for the address it is going
 ; to (see DiskCart.cxx). build_stub.py asserts this equals the RAM part's
 ; actual assembled length on every build -- update it there if it grows.
-RAM_STUB_LEN    EQU 301
+RAM_STUB_LEN    EQU 405
 
 ; Reserved MSX RAM layout, relative to the base the INIT tail picks:
 ;   +0                       the dispatcher blob
@@ -392,8 +398,8 @@ SLOT_BYTE_OFS   EQU DISP_OFFSET + DISP_SIZE
 BAS_RET_OFS     EQU DISP_ENTRIES * 3
 BAS_CHAIN_OFS   EQU BAS_RET_OFS + 3
 
-; And MailCmd, for the same reason and with the same answer. CALL MOUNT and
-; CALL EJECT are answered with /WAIT released, so the loop that polls for them
+; And MailCmd, for the same reason and with the same answer. CALL OMOUNT and
+; CALL OEJECT are answered with /WAIT released, so the loop that polls for them
 ; may not be fetched from a window: for the length of one of those commands the
 ; cartridge serves no bus at all. The dispatcher in the other window is handed
 ; MailCmd's address in IY by the trampoline that calls it; nothing calls this
@@ -625,38 +631,70 @@ TailStart:
     ; the old stack down), and the standard requires it of any INIT routine
     ; that lowers HIMEM.
     ;
-    ; BC = bytes of stack in use = HIMEM - SP.
+    ; Follow the Disk BASIC ALLOC contract, including its saved pointers.
+    ; HIMEM alone is insufficient: boot sectors such as Aleste 2 restore SP
+    ; from STKTOP, while DOS puts its RAM slot helpers below the new HIMEM.
+    ; Leaving STKTOP behind makes their first CALLF overwrite those helpers.
     ld      hl, 0
     add     hl, sp
     ex      de, hl                  ; DE = old SP
-    ld      hl, (HIMEM)
+    ld      hl, (STKTOP)
     or      a
     sbc     hl, de
-    jr      c, .stackMoved          ; SP above HIMEM: not our region at all
+    inc     hl                      ; include the byte at STKTOP, as ALLOC does
     ld      b, h
     ld      c, l
-
-    ; The new SP is the old one lowered by the same RESERVE_SIZE, so the stack
-    ; keeps exactly the headroom it had. The copy runs ascending and the
-    ; destination is below the source, so the overlap is safe in that
-    ; direction.
     ld      hl, -RESERVE_SIZE
-    add     hl, de                  ; HL = new SP
+    add     hl, de
     ld      sp, hl
-    ld      a, b
-    or      c
-    jr      z, .stackMoved          ; SP was exactly HIMEM: ldir would copy 64K
-    ex      de, hl                  ; HL = old SP (source), DE = new SP
+    ex      de, hl                  ; HL = source, DE = lowered stack
     ldir
-.stackMoved:
 
-    ; Reserve RESERVE_SIZE bytes below HIMEM. HL ends up pointing at the base
-    ; of our area.
+    ld      bc, -RESERVE_SIZE
     ld      hl, (HIMEM)
-    ld      de, RESERVE_SIZE
-    or      a
-    sbc     hl, de
+    add     hl, bc
     ld      (HIMEM), hl
+    ld      de, -2*(2+9+256)         ; two BASIC FCBs, matching vendor ALLOC
+    add     hl, de
+    ld      (FILTAB), hl
+    ex      de, hl                  ; DE = relocated FCB table
+    ld      hl, (MEMSIZ)
+    add     hl, bc
+    ld      (MEMSIZ), hl
+    ld      hl, (NULBUF)
+    add     hl, bc
+    ld      (NULBUF), hl
+    ld      hl, (STKTOP)
+    add     hl, bc
+    ld      (STKTOP), hl
+    dec     hl
+    dec     hl
+    ld      (SAVSTK), hl
+
+    ; Rebuild closed FCBs rather than retaining pointers into their old area.
+    ; This is the same initialization used by Disk BASIC's ALLOC/CLRFCB.
+    ld      l, e                    ; HL = DE = FILTAB
+    ld      h, d
+    inc     hl
+    inc     hl
+    inc     hl
+    inc     hl
+    ld      a, 2
+.fcb:
+    ex      de, hl
+    ld      (hl), e
+    inc     hl
+    ld      (hl), d
+    inc     hl
+    ex      de, hl
+    ld      bc, 7
+    ld      (hl), b
+    add     hl, bc
+    ld      (hl), b
+    ld      bc, 9+256-7
+    add     hl, bc
+    dec     a
+    jr      nz, .fcb
 
     ; 4. Hand the address to the firmware, behind the handshake. It rewrites
     ; the six jump table operands in its own copy of the ROM image and leaves
@@ -907,7 +945,7 @@ BasicClose:
 ; read path did on hardware, crashing once per command, and it is why reads now
 ; hold the line instead.
 ;
-; Both windows are covered by that: CALL MOUNT is fetched from the BASIC window
+; Both windows are covered by that: CALL OMOUNT is fetched from the BASIC window
 ; at BAS_BASE rather than the dispatcher's at WIN_BASE, and the firmware stops
 ; answering either one just the same.
 ;
@@ -976,6 +1014,7 @@ MailCmd:
 ; -----------------------------------------------------------------------------
 TrampDskio:
     di
+    call    DiskShortcut
     call    WindowOn
     ld      ix, BounceCopy          ; the window calls this for page-1 chunks
     ld      iy, MailCmd             ; ... and this for the slow commands
@@ -984,6 +1023,7 @@ TrampDskio:
 
 TrampDskchg:
     di
+    call    DiskShortcut
     call    WindowOn
     call    WIN_DSKCHG
 TrampExit:
@@ -1002,6 +1042,82 @@ WindowOn:
     push    af
     ld      a, CMD_DISK_WINDOW_ON
     ld      (CART_CMD), a
+    pop     af
+    ret
+
+; A single held digit 1..9 selects a discovered DSK member in drive A before this disk
+; call. Read the PPI directly: games may disable BIOS keyboard scanning or
+; replace the timer hook. No BIOS call here may re-enable interrupts. Preserve
+; port C's upper outputs (tape/click) and original keyboard row on every path.
+; Only an unambiguous single digit is accepted. Scan on both disk entry points:
+; a game doing raw sector reads need not call DSKCHG first.
+;
+; This lives in RAM and runs BEFORE WindowOn. Selecting an image opens files,
+; syncs pending writes and rebuilds its sector map with /WAIT released, so the
+; entire command/poll must run outside the unserved cartridge windows.
+DiskShortcut:
+    push    af
+    or      a
+    jr      nz, .exit               ; drive A only
+    push    bc
+    push    de
+    push    hl
+    ld      c, 0
+    in      a, ($AA)
+    ld      d, a
+    ld      a, d
+    and     $F0                    ; row 0: digits 0..7
+    out     ($AA), a
+    in      a, ($A9)
+    cpl
+    bit     0, a                   ; 0 is not a disk; reject 0+another digit too
+    jr      nz, .restore
+    and     $FE                    ; ignore 0
+    ld      l, a
+    ld      a, d
+    and     $F0
+    or      1                      ; row 1: digits 8 and 9 in bits 0 and 1
+    out     ($AA), a
+    in      a, ($A9)
+    cpl
+    and     3
+    ld      h, a
+    srl     h
+    rr      l                      ; drop bit 0 before scanning digits 1..9
+    ld      b, 9
+.scan:
+    srl     h
+    rr      l
+    jr      nc, .next
+    ld      a, c
+    or      a
+    jr      nz, .ambiguous
+    ld      a, 10
+    sub     b
+    ld      c, a
+.next:
+    djnz    .scan
+    jr      .restore
+.ambiguous:
+    ld      c, 0
+.restore:
+    ld      a, d
+    out     ($AA), a
+    ld      a, c
+    or      a
+    jr      z, .done
+    ld      (P_COUNT), a           ; number, 1..9
+    xor     a
+    ld      (P_DRIVE), a
+    ld      a, CMD_DISK_SELECT
+    call    MailCmd
+    ; A failed selection leaves the old disk inserted. Continue the original
+    ; disk call with its original arguments; never consume the changed flag.
+.done:
+    pop     hl
+    pop     de
+    pop     bc
+.exit:
     pop     af
     ret
 
@@ -1242,6 +1358,8 @@ BounceDir:      db 0        ; nonzero when the MSX side is BounceFrom
     ; Neither is a relocation site: the value comes from the firmware, not from
     ; this blob's assembly origin. build_stub.py checks the shape on every
     ; build.
+    ASSERT $ <= TrampTable + RAM_STUB_LEN - 4
+    ds (TrampTable + RAM_STUB_LEN - 4 - $), 0 ; keep the published RAM layout
     db      $5A, $A5
 OrigStatementAddr:
     dw      0
@@ -1755,15 +1873,15 @@ WinEnd:
 ; that matter -- both are the vendor's -- and if they still work, the door is
 ; hung correctly.
 ;
-; The table's own names are CALL MOUNT and CALL EJECT, which change the disk in
-; a running machine, CALL DISK, which says what is in each drive, and CALL DIR,
+; The table's own names are CALL OMOUNT and CALL OEJECT, which change the disk in
+; a running machine, CALL ODISK, which says what is in each drive, and CALL ODIR,
 ; which lists the cartridge's own volume. Everything the first two do is: parse
 ; the literal, put the path in the exchange buffer and the drive in the
 ; parameter block, send one command, and print a line if it failed. The
 ; firmware's Mount() raises the disk-changed flag, so the next DSKCHG tells Disk
 ; BASIC the media changed and the DPB is re-read from the new image's own boot
-; sector -- nothing here has to invalidate anything. CALL DISK parses nothing
-; and sends one command of its own, then prints what came back. CALL DIR is the
+; sector -- nothing here has to invalidate anything. CALL ODISK parses nothing
+; and sends one command of its own, then prints what came back. CALL ODIR is the
 ; only one that is a loop: one command per directory entry, for as long as the
 ; directory lasts.
 ;
@@ -1945,8 +2063,8 @@ BasEntry:
     ; in page 0 and RAM until it reaches H.TIMI, and on both supported dumps
     ; H.TIMI is the Disk ROM's motor-off timer, at 0x7837 (National) or 0x7827
     ; (Yamaha): inside this window, where the bytes the hook CALLFs into are
-    ; this blob's rather than the timer's. That would hang CALL DIR every
-    ; time and CALL DISK often -- read off the dumps' own bytes, not measured
+    ; this blob's rather than the timer's. That would hang CALL ODIR every
+    ; time and CALL ODISK often -- read off the dumps' own bytes, not measured
     ; on a machine: the mechanism is certain, the symptom is inferred. So a
     ; ret is written over the first byte of H.KEYI and of H.TIMI below, and
     ; the bytes go back in BasHooksBack, which both exits run before the
@@ -2026,7 +2144,7 @@ BasEntry:
 ; table's does is a match; anything else chains.
 ;
 ; Both halves of that matter. Comparing only the table's bytes would make every
-; vendor name that begins with one of ours -- MOUNTED against MOUNT -- our own,
+; vendor name that begins with one of ours -- OMOUNTED against OMOUNT -- our own,
 ; and it would be taken silently: the argument would parse as nonsense and the
 ; disk would change under a program that asked for something else entirely.
 ; -----------------------------------------------------------------------------
@@ -2064,11 +2182,11 @@ BasEntry:
     jr      .name
 
 ; -----------------------------------------------------------------------------
-; CALL MOUNT("[X:]path") and CALL EJECT(["X:"]).
+; CALL OMOUNT("[X:]path") and CALL OEJECT(["X:"]).
 ;
 ; One body: both are a parsed argument and one command, and the command code is
 ; the only difference between them. EJECT ignores the path the firmware is
-; handed, which costs nothing and keeps CALL EJECT("B:") -- prefix, no path --
+; handed, which costs nothing and keeps CALL OEJECT("B:") -- prefix, no path --
 ; from needing a case of its own.
 ; -----------------------------------------------------------------------------
 BasMount:
@@ -2148,7 +2266,7 @@ BasDone:
     jp      BasGoRet
 
 ; -----------------------------------------------------------------------------
-; CALL DISK -- what is in each drive.
+; CALL ODISK -- what is in each drive.
 ;
 ; No argument, so nothing is parsed and BASIC's text pointer goes back exactly
 ; as it arrived: whatever the user typed after the name is BASIC's own syntax
@@ -2283,7 +2401,7 @@ BasKB:
     jp      BasPutc
 
 ; -----------------------------------------------------------------------------
-; CALL DIR(["path"]) -- the cartridge's own volume, one entry to a line.
+; CALL ODIR(["path"]) -- the cartridge's own volume, one entry to a line.
 ;
 ; The one statement that is a loop: CMD_BASIC_DIR_OPEN opens a directory and
 ; CMD_BASIC_DIR_NEXT steps it, one round trip per entry, until the firmware
@@ -2291,7 +2409,7 @@ BasKB:
 ; window close every exit below sends closes it on any path that stops early,
 ; so nothing here has to carry a handle it might drop.
 ;
-; The argument goes through BasArg, the parser CALL MOUNT uses, so an overlong
+; The argument goes through BasArg, the parser CALL OMOUNT uses, so an overlong
 ; path is refused here in the same words and the literal reaches the exchange
 ; buffer bounded. That parser also takes an "X:" prefix off the front and puts
 ; the drive in P_DRIVE, which no directory command reads: a listing is of the
@@ -2509,14 +2627,14 @@ BasMailVec      EQU $-2
 ;                      BasMsg is the line to print instead of sending anything,
 ;                      or zero; BasPath is where the path starts in BASIC's
 ;                      text, past the drive prefix, or an empty literal's
-;                      closing quote when there was no argument. Only CALL DIR
+;                      closing quote when there was no argument. Only CALL ODIR
 ;                      reads it -- its header prints the path from the text,
 ;                      because the copy at CART_BUF is write-only from here:
 ;                      the buffer answers reads only while a reply has it
 ;                      open, and the open's reply is a status alone.
 ;
-; No argument at all is drive A and an empty path. That is what CALL EJECT
-; means, and for CALL MOUNT the empty path reaches the firmware as a file that
+; No argument at all is drive A and an empty path. That is what CALL OEJECT
+; means, and for CALL OMOUNT the empty path reaches the firmware as a file that
 ; cannot be opened -- which is the truth, reported in the same words as any
 ; other name that does not exist.
 ; -----------------------------------------------------------------------------
@@ -2565,7 +2683,7 @@ BasArg:
     call    BasDrive
 
 .copy:
-    ld      (BasPath), hl           ; the path as typed, for CALL DIR's header
+    ld      (BasPath), hl           ; the path as typed, for CALL ODIR's header
     ld      de, CART_BUF
     ld      b, BAS_PATH_MAX
 .byte:
@@ -2653,7 +2771,7 @@ BasDrive:
     ret
 
 ; -----------------------------------------------------------------------------
-; Printing, in four pieces because CALL DISK and CALL DIR build their lines out
+; Printing, in four pieces because CALL ODISK and CALL ODIR build their lines out
 ; of parts where the statements above print whole ones.
 ;
 ;   BasPrint  a NUL-terminated line, ended with CR LF
@@ -2726,8 +2844,8 @@ BasPutc:
     ; the BIOS handler, and the handler calls H.TIMI, and on both supported
     ; dumps H.TIMI is the Disk ROM's motor-off timer at 0x7837 (National) or
     ; 0x7827 (Yamaha) -- inside this window, so the CALLF lands on this blob's
-    ; bytes and the machine hangs -- CALL DIR would hang every time and CALL
-    ; DISK often, by the dumps' own bytes, not measured on a machine. What
+    ; bytes and the machine hangs -- CALL ODIR would hang every time and CALL
+    ; ODISK often, by the dumps' own bytes, not measured on a machine. What
     ; keeps the window safe is BasEntry writing a ret over H.KEYI and H.TIMI
     ; for the length of the statement, so the handler that the ei lets in
     ; never leaves page 0 and RAM; both exits put the hooks back.
@@ -2829,13 +2947,13 @@ BasNames:
     dw      BasOcopy
     db      4, "ONEW"
     dw      BasOnew
-    db      5, "MOUNT"
+    db      6, "OMOUNT"
     dw      BasMount
-    db      5, "EJECT"
+    db      6, "OEJECT"
     dw      BasEject
-    db      4, "DISK"
+    db      5, "ODISK"
     dw      BasDisk
-    db      3, "DIR"
+    db      4, "ODIR"
     dw      BasDir
     db      0
 
@@ -2852,13 +2970,13 @@ MsgNotFound:    db "FILE NOT FOUND", 0
 MsgNoDrive:     db "NO SUCH DRIVE", 0
 MsgNoAnswer:    db "CARTRIDGE NOT RESPONDING", 0
 
-; And what CALL DISK says about a drive rather than about a failure. The gap
+; And what CALL ODISK says about a drive rather than about a failure. The gap
 ; before "(protected)" is inside that string rather than printed separately, so
 ; that the common case -- a writable image -- emits nothing extra at all.
 MsgEmpty:       db "-- empty --", 0
 MsgProtected:   db "  (protected)", 0
 
-; And what CALL DIR marks a directory with, against the same width in blanks for
+; And what CALL ODIR marks a directory with, against the same width in blanks for
 ; a file, so that the name starts in the same column either way. The gap between
 ; the marker and the name is inside the string, as "(protected)"'s is, so that
 ; an entry costs one string and no separate space. The ASSERTs are what keep a
@@ -2868,7 +2986,7 @@ MsgBlank:       db "      ", 0
     ASSERT MsgBlank - MsgDir == DIR_MARK_COLS + 1
     ASSERT $ - MsgBlank == DIR_MARK_COLS + 1
 
-; And where CALL DIR's header starts when the statement had no argument: the
+; And where CALL ODIR's header starts when the statement had no argument: the
 ; closing quote of a literal nobody typed, so that the walk to the closing quote
 ; ends at once and the root lists as "/" alone. See BasArg.
 MsgNoPath:      db '"'

@@ -79,8 +79,7 @@ void __not_in_flash_func(CSCCSound::reset())
         for (uint32_t i = 0; i < 32; ++i) {
             wave_[ch][i] = -1;
             volAdjustedWave_[ch][i] = adjustSample(-1, 15);
-            if (ch < 4)
-                waveShadow_[ch * 32 + i] = 0xFF;    // matches wave_ above
+            waveShadow_[ch * 32 + i] = 0xFF;    // matches wave_ above
         }
 
         periodLo_[ch] = 0;
@@ -93,6 +92,7 @@ void __not_in_flash_func(CSCCSound::reset())
 
     enableMask_ = 0;
     deform_ = 0;
+    dac_ = 128;
 
     sigmaError_ = 0;
     sccAccumulator_ = 0;
@@ -431,7 +431,15 @@ int16_t __not_in_flash_func(CSCCSound::nextSample)()
         mix = -DAC_SCALE;
     }
 
-    return (int16_t)mix;
+    // Attenuate the final signal without changing channel registers or phase.
+    const int32_t gain = (int32_t)masterGain_.load(std::memory_order_relaxed);
+    mix = (mix * gain) / 65536;
+    // DAC has a fixed half-scale contribution. SCC attenuation affects only
+    // SCC channels; final saturation protects the existing PDM modulator range.
+    mix += (int32_t(dac_) - 128) * (DAC_SCALE / 2) / 128;
+    if (mix > DAC_SCALE) mix = DAC_SCALE;
+    else if (mix < -DAC_SCALE) mix = -DAC_SCALE;
+    return int16_t(mix);
 }
 
 volatile bool sccInitialized_ = false;
@@ -446,32 +454,35 @@ void __not_in_flash_func(CSCCSound::drainWriteQueue())
 {
     CSCCWriteQueue<64>::Entry e;
     while (g_sccWriteQueue.pop(e)) {
-        uint8_t address = e.address;
-        uint8_t value = e.value;
-
-        address &= 0xFF;
+        if (e.address == 0x2000) {
+            dac_ = e.value;
+            continue;
+        }
+        const bool plus = (e.address & 0x1000) != 0;
+        uint8_t address = uint8_t(e.address);
+        const uint8_t value = e.value;
 
         // Wavetable RAM: 5 channels x 32 samples.
-        if (address < 0x80) {
+        if (address < (plus ? 0xa0 : 0x80)) {
             const uint32_t ch = address >> 5;
             const uint32_t index = address & 0x1F;
 
             if (ch >= 5) return; 
 
-            if (ch < 4) {
+            if (ch < 5) {
                 wave_[ch][index] = (int8_t)value;
                 volAdjustedWave_[ch][index] =
                     adjustSample(wave_[ch][index], volume_[ch]);
 
                 // Channel 4 mirrors channel 3's waveform on the real SCC.
-                if (ch == 3) {
+                if (ch == 3 && !plus) {
                     wave_[4][index] = wave_[3][index];
                     volAdjustedWave_[4][index] =
                         adjustSample(wave_[4][index], volume_[4]);
                 }
 
                 out_[ch] = volAdjustedWave_[ch][wavePos_[ch] & 31u];
-                if (ch == 3) {
+                if (ch == 3 && !plus) {
                     out_[4] = volAdjustedWave_[4][wavePos_[4] & 31u];
                 }
             }
@@ -479,6 +490,12 @@ void __not_in_flash_func(CSCCSound::drainWriteQueue())
             return;
         }
 
+        // SCC+ moves control registers above its independent fifth waveform.
+        if (plus) {
+            if (address >= 0xa0 && address < 0xc0) address -= 0x20;
+            else if (address >= 0xc0 && address < 0xe0) address = 0xe0;
+            else continue;
+        }
         // Frequency, volume, and enable registers.
         if (address < 0xA0) {
             const uint32_t reg = address & 0x0F;
@@ -573,6 +590,13 @@ void __not_in_flash_func(CSCCSound::service())
  * 0xE0 deformation register is implemented as write-only on read (returns 0xFF
  * but is considered "initialized").
  */
+// KUC waveform read-back must be synchronous with the bus-side write, even
+// when Core 1 has not yet consumed the corresponding synthesis event.
+uint8_t __not_in_flash_func(CSCCSound::readKUCRegister)(uint8_t address, bool plus)
+{
+    return address < (plus ? 0xa0 : 0x80) ? waveShadow_[address] : 0xff;
+}
+
 uint8_t __not_in_flash_func(CSCCSound::readRegister)(uint8_t address)
 {
     address &= 0xFF;

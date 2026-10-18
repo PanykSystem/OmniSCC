@@ -1,5 +1,8 @@
 #include "Loader.hxx"
+#include "FirmwareVersion.h"
 #include "OmniSCC.hxx"
+#include "AudioOptions.h"
+#include "VolumeAccess.h"
 #include <string.h>
 #include <stdio.h> // For snprintf
 
@@ -27,10 +30,11 @@ extern const char __car_start[];
 
 // Static 8 KB buffer shared with the MSX through the 0x6000-0x7FFE window.
 // It is static because the Z80 may still read it after a command returns.
-uint8_t CLoader::exchange_buffer[LOADER_BUFFER_SIZE];
+uint8_t __attribute__((section(".scratch_x.loader_exchange"))) CLoader::exchange_buffer[LOADER_BUFFER_SIZE];
 
-CLoader::CLoader(COmniSCC& multiCart, CSCCSound& scc, const char* _data, bool hasRom) : CCartridge(multiCart, 0, 0), _scc(scc)
+CLoader::CLoader(COmniSCC& multiCart, CSCCSound& scc, const char* _data, bool hasRom, const char* upperRom) : CCartridge(multiCart, 0, 0), _scc(scc)
 {
+    _upperRom = _data && hasRom ? upperRom : nullptr;
     return_buffer = false;
     last_cmd_result = 0;
     
@@ -153,8 +157,8 @@ bool __not_in_flash_func(CLoader::Execute())
             //     as the result stands, which is exactly while the Z80 is
             //     reading a payload out, so this byte is shadowed throughout.
             //     See LOADER_READY_SENTINEL and LOADER_PAYLOAD_MAX.
-            else if (addr == STATUS_REG_ADDR && last_cmd_result != 0xFF) {
-                data = LOADER_READY_SENTINEL;
+            else if (addr == STATUS_REG_ADDR) {
+                data = last_cmd_result != 0xFF ? LOADER_READY_SENTINEL : 0xFF;
             }
             // 2. Exchange buffer, but only when a command has explicitly opened it.
             //    Keeping it closed by default prevents the MSX BIOS from seeing
@@ -162,7 +166,7 @@ bool __not_in_flash_func(CLoader::Execute())
             else if (return_buffer && (addr >= BUFFER_START_ADDR) && (addr <= BUFFER_END_ADDR)) {
                 data = exchange_buffer[addr - BUFFER_START_ADDR];
             }
-            // 3. Normal ROM read from the preloader/loader image at 0x4000-0x5FFF.
+            // 3. ROM read: upper menu bytes are exposed only when the buffer is closed.
             else {
                 // SCC register reads have priority over ROM reads.
                 if (sccEnabled && (addr >= 0x9800) && (addr < 0xA000)) {
@@ -173,6 +177,9 @@ bool __not_in_flash_func(CLoader::Execute())
                 // ROM: those reads keep the 0xFF default.
                 else if (car_data && addr >= 0x4000 && addr < 0x6000) {
                     data = car_data[addr - 0x4000];
+                }
+                else if (_upperRom && addr >= 0x6000 && addr < STATUS_REG_ADDR) {
+                    data = _upperRom[addr - 0x6000];
                 }
             }
 
@@ -232,7 +239,29 @@ bool __not_in_flash_func(CLoader::Execute())
                     case 0x00: last_cmd_result = 0; break; // CMD_CLOSE_BUFFER
                     case 0x01: CmdMapFile(); break;        // CMD_MAP_FILE
                     case 0x02: CmdMapSCC(); break;         // CMD_MAP_SCC
+                    case 0x04: CmdMapNextor(); break;      // CMD_MAP_NEXTOR
                     case 0x03: CmdMapDisk(); break;        // CMD_MAP_DISK
+                    case CMD_SET_SCC_VOLUME:
+                        last_cmd_result = _scc.SetMasterVolume(exchange_buffer[0]) ? 0 : 0xFE;
+                        break;
+                    case CMD_SET_DISK_OPTIONS:
+                        last_cmd_result = _multiCart.SetDiskOptions(exchange_buffer[0]) ? 0 : 0xFE;
+                        break;
+                    case CMD_SET_KUC_OPTIONS:
+                        last_cmd_result = _multiCart.SetKUCOptions(exchange_buffer[0]) ? 0 : 0xFE;
+                        break;
+                    case CMD_SET_ROM_DATABASE:
+                        exchange_buffer[LOADER_BUFFER_SIZE - 1] = 0;
+                        last_cmd_result = _multiCart.SetRomDatabasePath((char*)exchange_buffer) ? 0 : 0xFE;
+                        break;
+                    case 0x05:                          // CMD_GET_FW_VERSION
+                        static_assert(sizeof(OMNISCC_FW_VERSION) <= 13,
+                                      "FW version must fit the Help heading");
+                        memcpy(exchange_buffer, OMNISCC_FW_VERSION,
+                               sizeof(OMNISCC_FW_VERSION));
+                        return_buffer = true;
+                        last_cmd_result = 0;
+                        break;
 
                     // --- Filesystem commands ---
                     case 0x10: CmdFileOpenRead(); break;
@@ -309,19 +338,39 @@ bool __not_in_flash_func(CLoader::Execute())
  *
  * The Z80 must write a null-terminated filename into the exchange buffer before
  * issuing this command. On success the loader is replaced by the requested ROM;
- * on failure last_cmd_result is set to 0xFE.
+ * on failure last_cmd_result carries the specific MountResult code.
  */
+// Deliberately not inlined: flash flushing must finish before this frame exists.
+uint8_t __attribute__((noinline)) CLoader::MapWithUpperBackup(bool nextor, int romType) {
+    uint8_t upperBackup[0x2000];
+    memcpy(upperBackup, _upperRom, sizeof(upperBackup));
+    const uint8_t result = nextor ? (uint8_t)_multiCart.MountNextor((char*)exchange_buffer) :
+        (_multiCart.MountPrepared((char*)exchange_buffer, static_cast<COmniSCC::CartType>(romType)) ? 0 : (uint8_t)_multiCart.LastMountResult());
+    if (result) memcpy(const_cast<char*>(_upperRom), upperBackup, sizeof(upperBackup));
+    return result;
+}
+
 void CLoader::CmdMapFile() {
     // Ensure the string is terminated even if the Z80 forgot the trailing zero.
     exchange_buffer[LOADER_BUFFER_SIZE - 1] = '\0';
     
-    if(_multiCart.Mount((char*)exchange_buffer))
-    {
-        _exitFlag = true; // Signal Execute() to return so the new cartridge runs.
-        last_cmd_result = 0;
+    if (!CloseVolumeHandles()) { last_cmd_result = (uint8_t)MountResult::FileRead; return; }
+    // Flush before entering the large backup frame. Mount's later handover
+    // then has no pending flash-map erase to put underneath the 8 KiB backup.
+    if (_upperRom && !volume_sync(VOLUME_MENU)) {
+        last_cmd_result = (uint8_t)MountResult::FileRead; return;
     }
-    else
-        last_cmd_result = 0xfe;
+    // KUC preserves the menu's upper 8 KiB by construction (linker checked).
+    // Its filesystem preparation needs stack space, so do not retain the
+    // ordinary mount path's 8 KiB rollback frame underneath it.
+    COmniSCC::CartType type;
+    if (!_multiCart.PrepareROM((char*)exchange_buffer, LOADER_BUFFER_SIZE, type)) {
+        last_cmd_result = (uint8_t)_multiCart.LastMountResult(); return;
+    }
+    const bool preservesUpper = type == COmniSCC::CT_KUC;
+    last_cmd_result = (_upperRom && !preservesUpper) ? MapWithUpperBackup(false, int(type)) :
+        (_multiCart.MountPrepared((char*)exchange_buffer, type) ? 0 : (uint8_t)_multiCart.LastMountResult());
+    if (!last_cmd_result) _exitFlag = true;
 }
 
 /**
@@ -351,6 +400,23 @@ void CLoader::CmdMapSCC() {
  * and finds it: unlike a ROM, a disk interface only gets its INIT called
  * during that scan, not by jumping straight into it.
  */
+bool CLoader::CloseVolumeHandles() {
+    if (current_file.obj.fs && f_close(&current_file) != FR_OK) return false;
+    if (current_dir.obj.fs && f_closedir(&current_dir) != FR_OK) return false;
+    return true;
+}
+
+void CLoader::CmdMapNextor() {
+    exchange_buffer[LOADER_BUFFER_SIZE-1] = 0;
+    if (strlen((char*)exchange_buffer) > 64 || !CloseVolumeHandles()) {
+        last_cmd_result = 4; return;
+    }
+    if (_upperRom && !volume_sync(VOLUME_MENU)) { last_cmd_result = 4; return; }
+    last_cmd_result = _upperRom ? MapWithUpperBackup(true) :
+        (uint8_t)_multiCart.MountNextor((char*)exchange_buffer);
+    if (!last_cmd_result) _exitFlag = true;
+}
+
 void CLoader::CmdMapDisk() {
     exchange_buffer[LOADER_BUFFER_SIZE - 1] = '\0';
 
@@ -383,7 +449,7 @@ void CLoader::CmdMapDisk() {
         last_cmd_result = 0;
     }
     else
-        last_cmd_result = 0xfe;
+        last_cmd_result = static_cast<uint8_t>(_multiCart.LastMountResult());
 }
 
 // ============================================================================

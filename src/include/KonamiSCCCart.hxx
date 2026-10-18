@@ -15,9 +15,11 @@ class CKonamiSCCCartridge: public CCartridge
 {
 public:
     CKonamiSCCCartridge(COmniSCC& multiCart, CSCCSound& scc, uint8_t* data, uint32_t sizeMask);
+    CKonamiSCCCartridge(COmniSCC& multiCart, CSCCSound& scc, const RomStorage& storage);
     ~CKonamiSCCCartridge();
 
 private:
+    template<RomStorageKind Kind> __attribute__((noinline, section(".time_critical.KonamiSCCCart_storage"))) bool ExecuteStorage();
     virtual bool Execute();
     CSCCSound& _scc;
 };

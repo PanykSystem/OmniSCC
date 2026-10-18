@@ -1,3 +1,7 @@
 [submodule "src/libs/pico_fatfs"]
 	path = src/libs/pico_fatfs
 	url = https://github.com/elehobica/pico_fatfs.git
+
+[submodule "src/msx/nextor/upstream"]
+	path = src/msx/nextor/upstream
+	url = https://github.com/Konamiman/Nextor.git

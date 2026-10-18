@@ -15,8 +15,10 @@ class CKonamiCartridge: public CCartridge
 {
 public:
     CKonamiCartridge(COmniSCC& multiCart, uint8_t* data, uint32_t sizeMask);
+    CKonamiCartridge(COmniSCC& multiCart, const RomStorage& storage);
     ~CKonamiCartridge();
 
 private:
+    template<RomStorageKind Kind> __attribute__((noinline, section(".time_critical.KonamiCart_storage"))) bool ExecuteStorage();
     virtual bool Execute();
 };

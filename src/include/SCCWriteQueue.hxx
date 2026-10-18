@@ -15,7 +15,7 @@ class CSCCWriteQueue
 
 public:
     struct Entry {
-        uint8_t address;
+        uint16_t address; // Low byte is the register; high bits tag KUC audio events.
         uint8_t value;
     };
 
@@ -24,7 +24,7 @@ public:
     // Producer side: called from Core 0 inside the RAM-resident Execute() loop.
     // Must be inlined to avoid flash latency on the hot path.
     __attribute__((always_inline))
-    inline bool push(uint8_t address, uint8_t value)
+    inline bool push(uint16_t address, uint8_t value)
     {
         const uint32_t head = head_;
         const uint32_t nextHead = (head + 1) & (CAPACITY - 1);

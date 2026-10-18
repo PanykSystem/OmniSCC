@@ -6,6 +6,8 @@
 #pragma once
 
 #include <stdint.h>
+#include "DiskSet.hxx"
+#include "MountResult.hxx"
 
 extern "C" {
 #include "ff.h"
@@ -33,8 +35,15 @@ public:
     ~CDiskImage();
 
     // Open `path` and prepare it for sector access. Replaces any image already
-    // mounted and raises the disk-changed flag.
+    // mounted and raises the disk-changed flag. A failed replacement leaves
+    // the current disk and its change flag intact.
     bool Mount(const char* path);
+    MountResult LastMountResult() const { return _mountResult; }
+
+    // Select a discovered .diskN.dsk or (Disk x of y) sibling without rescanning
+    // the set. Selecting the current member is a no-op; a missing/failed
+    // member leaves the current disk inserted.
+    bool SelectDisk(unsigned number);
 
     // Close the mounted image, if any, and reset the sector count. Ejecting
     // media is itself a change, so this raises the disk-changed flag whenever
@@ -101,7 +110,7 @@ public:
     bool ReadOnly() const { return _readOnly; }
 
     // The path Mount() was given, or "" when nothing is mounted. Reported by
-    // CMD_BASIC_INFO so CALL DISK can name the image without FatFs's help --
+    // CMD_BASIC_INFO so CALL ODISK can name the image without FatFs's help --
     // FIL keeps no name of its own.
     const char* Path() const { return _path; }
 
@@ -109,6 +118,10 @@ public:
     bool TakeChangedFlag();
 
 private:
+    MountResult _mountResult = MountResult::Unknown;
+    bool mountImage(const char* path, bool discover);
+    void discoverSet(const char* path);
+    CDiskSet _set;
     // Direct map: image sector -> FS (flash) sector. When built at Mount, Read
     // serves sectors straight from flash with no FatFs call, so a fragmented or
     // large image cannot drag a linear cluster-chain seek into the /WAIT-held

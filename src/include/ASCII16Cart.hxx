@@ -15,8 +15,10 @@ class CASCII16Cartridge: public CCartridge
 {
 public:
     CASCII16Cartridge(COmniSCC& multiCart, uint8_t* data, uint32_t sizeMask);
+    CASCII16Cartridge(COmniSCC& multiCart, const RomStorage& storage);
     ~CASCII16Cartridge();
 
 private:
+    template<RomStorageKind Kind> __attribute__((noinline, section(".time_critical.ASCII16Cart_storage"))) bool ExecuteStorage();
     virtual bool Execute();
 };

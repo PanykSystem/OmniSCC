@@ -248,7 +248,7 @@ bool __not_in_flash_func(CDiskCartridge::Execute())
                 _driverWindow = false;
                 _basicWindow = false;
 
-                // A reset taken inside CALL DIR strands the listing's
+                // A reset taken inside CALL ODIR strands the listing's
                 // directory as well: the window close that ends every
                 // statement is what would have closed it, and it is never
                 // sent. The handle is dropped here rather than closed, because
@@ -353,25 +353,29 @@ bool __not_in_flash_func(CDiskCartridge::Execute())
                 // handle and nothing else.
                 case 0x3A: _basicWindow = false;  CloseBasicDir();
                            last_cmd_result = 0; break;
-                // CALL MOUNT and CALL EJECT. Both open or close a file, which
+                // CALL OMOUNT and CALL OEJECT. Both open or close a file, which
                 // is file I/O and cannot run with the Z80 stalled, so both
                 // release /WAIT and are polled for from MailCmd in MSX RAM --
                 // the same regime as the flash commands above.
                 case 0x3B: CmdBasicMount(); busReleased = true; break;
                 case 0x3C: CmdBasicEject(); busReleased = true; break;
-                // CALL DIR's pair, and both belong with the mount rather than
+                // CALL ODIR's pair, and both belong with the mount rather than
                 // with the info below: opening a directory walks the path's
                 // components and stepping one scans directory sectors past
                 // whatever is hidden in them, neither of which is bounded in
                 // microseconds the way a capped sector read is.
                 case 0x3D: CmdBasicDirOpen(); busReleased = true; break;
                 case 0x3E: CmdBasicDirNext(); busReleased = true; break;
-                // CALL DISK. Not one of those: it reads four accessors off two
+                // CALL ODISK. Not one of those: it reads four accessors off two
                 // objects already in RAM and copies two short paths, so it is
                 // answered on the fast path with the line still held.
                 case 0x3F: CmdBasicInfo();        break;
                 case 0x40: case 0x41: case 0x42: case 0x43:
                     CmdFile(data); busReleased = true; break;
+                case CMD_SET_DISK_OPTIONS:
+                    last_cmd_result = _multiCart.SetDiskOptions(_buf[0]) ? 0 : 0xFE;
+                    break;
+                case DISK_CMD_SELECT: CmdDiskSelect(); busReleased = true; break;
                 default:   last_cmd_result = 0xFE; break;
                 }
 
@@ -493,7 +497,7 @@ CDiskImage* CDiskCartridge::DriveImage()
  * The drive a command names, whether or not it holds a disk.
  *
  * DriveImage() answers null for an empty drive, which is what every sector
- * command wants: there is nothing there to read or write. CALL MOUNT and CALL
+ * command wants: there is nothing there to read or write. CALL OMOUNT and CALL
  * EJECT are about the drive rather than about the disk in it -- an empty drive
  * is exactly the one a mount is aimed at -- so they ask for the drive itself.
  * Null here means there is no such drive at all, which the driver already
@@ -503,6 +507,23 @@ CDiskImage* CDiskCartridge::DriveImage()
 CDiskImage* CDiskCartridge::DriveSlot()
 {
     return DriveSlot(_buf[DISK_P_DRIVE]);
+}
+
+// Called from the RAM trampoline before opening the code window. File I/O
+// must release /WAIT so MSX DRAM is refreshed while replacing the image.
+void CDiskCartridge::CmdDiskSelect()
+{
+    releaseWait();
+    if (!(_multiCart.DiskOptions() & DISK_OPTION_MULTIDISK)) {
+        last_cmd_result = 0xFE;
+        return;
+    }
+    if (_buf[DISK_P_DRIVE] != 0) {
+        last_cmd_result = DISK_ST_NOTREADY;
+        return;
+    }
+    const unsigned number = _buf[DISK_P_COUNT];
+    last_cmd_result = _image.SelectDisk(number) ? 0 : DISK_ST_NOFILE;
 }
 
 /**
@@ -777,7 +798,7 @@ void CDiskCartridge::CmdDiskSetRam()
 /**
  * CMD_BASIC_MOUNT (0x3B).
  *
- * CALL MOUNT("[X:]path"): put a different image in a drive without rebooting
+ * CALL OMOUNT("[X:]path"): put a different image in a drive without rebooting
  * the machine. The path is NUL-terminated at the base of the exchange buffer
  * and the drive is in DISK_P_DRIVE; the driver has already taken the "A:"/"B:"
  * prefix off the path and refused any other letter, so a drive number that is
@@ -789,17 +810,9 @@ void CDiskCartridge::CmdDiskSetRam()
  * the media changed and it re-reads the DPB from the new image's own boot
  * sector -- which is how a 360 KB image can replace a 720 KB one mid-session.
  *
- * The path is checked BEFORE Mount() is called, because Mount() starts with
- * Unmount(): a typo in a name would otherwise empty the drive and then report
- * the typo, and the disk a program was running from is gone. f_stat is what
- * Mount() would have found out the hard way -- the file exists, is a file and
- * not a directory, and is a non-zero whole number of 512-byte sectors -- and
- * a path that fails any of it answers DISK_ST_NOFILE with the drive untouched.
- * The same three conditions Mount() itself enforces, checked here rather than
- * moved into CDiskImage, whose Mount() the loader's boot path shares. Between
- * the stat and the open the file could still change underneath; nothing on
- * the MSX side can make that happen, and the answer then is a failed Mount()
- * with an empty drive, which is the pre-existing behaviour and not a new one.
+ * Mount() validates a candidate handle and syncs the old disk before replacing
+ * it. A missing, invalid or unopenable image leaves the current disk in place.
+ * Successful explicit mounts rediscover the numbered set.
  *
  * Answered with /WAIT released, like the flash commands and for the same
  * reason: this opens a file and builds a CLMT, which is unbounded file I/O
@@ -831,26 +844,13 @@ void CDiskCartridge::CmdBasicMount()
 
     releaseWait();
 
-    // One status for every way an image can fail to arrive. A name with no file
-    // behind it, a directory, and a file that is not a whole number of 512-byte
-    // sectors are the same answer to whoever typed it -- that is not a disk
-    // this drive can take -- and Mount() does not distinguish them either. An
-    // empty path is refused here too: f_stat on "" answers FR_INVALID_NAME,
-    // where Mount() would have unmounted first and then failed to open it.
-    FILINFO info;
-    if (f_stat(path, &info) != FR_OK || (info.fattrib & AM_DIR) ||
-        info.fsize == 0 || (info.fsize % DSK_SECTOR_SIZE) != 0) {
-        last_cmd_result = DISK_ST_NOFILE;
-        return;
-    }
-
     last_cmd_result = image->Mount(path) ? 0 : DISK_ST_NOFILE;
 }
 
 /**
  * CMD_BASIC_EJECT (0x3C).
  *
- * CALL EJECT(["X:"]): leave the drive empty. Sector commands for it then answer
+ * CALL OEJECT(["X:"]): leave the drive empty. Sector commands for it then answer
  * DISK_ST_NOTREADY, which the driver turns into DSKIO's "not ready" -- the same
  * thing drive B is whenever loader.ini names no disk2=.
  *
@@ -878,7 +878,7 @@ void CDiskCartridge::CmdBasicEject()
 /**
  * CMD_BASIC_INFO (0x3F).
  *
- * CALL DISK: what is in each drive, in one reply. Two records at the base of the
+ * CALL ODISK: what is in each drive, in one reply. Two records at the base of the
  * exchange buffer, in drive order, each of them a state byte (bit 0 mounted,
  * bit 1 write-protected), the sector count as a little-endian word, and the path
  * with its NUL. An empty drive gets a full record too -- state 0, count 0, an
@@ -959,7 +959,7 @@ void CDiskCartridge::CloseBasicDir()
 /**
  * CMD_BASIC_DIR_OPEN (0x3D).
  *
- * CALL DIR(["path"]): open a directory of the cartridge's own FAT volume so
+ * CALL ODIR(["path"]): open a directory of the cartridge's own FAT volume so
  * that CMD_BASIC_DIR_NEXT can step it. The path is NUL-terminated at the base
  * of the exchange buffer and empty for the root; no command has to open the
  * buffer to put it there, because buffer-range writes are captured on every bus
@@ -998,7 +998,7 @@ void CDiskCartridge::CmdBasicDirOpen()
     releaseWait();
 
     // A listing that stopped early leaves its handle behind until the window
-    // close collects it; a second CALL DIR that arrives first must not inherit
+    // close collects it; a second CALL ODIR that arrives first must not inherit
     // it, and f_opendir would overwrite the object either way.
     CloseBasicDir();
 
@@ -1036,7 +1036,7 @@ void CDiskCartridge::CmdBasicDirOpen()
  * Hidden and system entries are skipped, which is what keeps a volume that has
  * been near a Mac from listing a screenful of "._" files. An entry that is
  * neither a directory nor a name ending in ".dsk" is skipped the same way --
- * CALL MOUNT never opens anything else, so a ROM, loader.ini or disk.rom
+ * CALL OMOUNT never opens anything else, so a ROM, loader.ini or disk.rom
  * sitting on the volume would only be noise in this listing.
  *
  * Answered with /WAIT released, like the open: a step walks directory sectors,
@@ -1097,7 +1097,7 @@ void CDiskCartridge::CmdBasicDirNext()
             continue;
         if (info.fattrib & AM_DIR)
             break;
-        // CALL MOUNT never opens anything but a directory or a .dsk image
+        // CALL OMOUNT never opens anything but a directory or a .dsk image
         // (CmdBasicMount -> CDiskImage::Mount), so a ROM, loader.ini or
         // disk.rom sitting in the same folder is skipped here just like a
         // hidden or system entry -- it is noise for this statement. fname is

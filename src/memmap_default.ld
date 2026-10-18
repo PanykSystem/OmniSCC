@@ -23,7 +23,7 @@
 
 MEMORY
 {
-    FLASH(rx) : ORIGIN = 0x10000000, LENGTH = 512k
+    FLASH(rx) : ORIGIN = 0x10000000, LENGTH = 1020k
     RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 224k
     SCRATCH_X(rwx) : ORIGIN = 0x20038000, LENGTH = 16k 
     SCRATCH_Y(rwx) : ORIGIN = 0x2003C000, LENGTH = 16k
@@ -67,8 +67,10 @@ SECTIONS
         /* TODO revisit this now memset/memcpy/float in ROM */
         /* bit of a hack right now to exclude all floating point and time critical (e.g. memset, memcpy) code from
          * FLASH ... we will include any thing excluded here in .data below by default */
+        /* CMake uses .S.o on Unix and .S.obj on Windows. Keep both SDK
+         * memory wrappers and their constants in SRAM via .data below. */
         *(.init)
-        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .text*)
+        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *mem_ops_aeabi.S.o *mem_ops_aeabi.S.obj) .text*)
         *(.fini)
         /* Pull all c'tors into .text */
         *crtbegin.o(.ctors)
@@ -88,7 +90,7 @@ SECTIONS
     } > FLASH
 
     .rodata : {
-        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .rodata*)
+        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *mem_ops_aeabi.S.o *mem_ops_aeabi.S.obj) .rodata*)
         . = ALIGN(4);
         *(SORT_BY_ALIGNMENT(SORT_BY_NAME(.flashdata*)))
         . = ALIGN(4);
@@ -204,6 +206,26 @@ SECTIONS
         __bss_end__ = .;
     } > RAM
 
+    /* KUC serves ROM from the first 104 KiB of the normal 128 KiB workspace.
+       Its runtime occupies the otherwise unused tail. The overlay preserves
+       all 128 KiB for ordinary ROMs and Nextor; only KUC loads the code image.
+       Padding in the load image avoids a second SRAM reservation. */
+    OVERLAY : {
+        .cart_workspace {
+            KEEP(*(.cart_workspace))
+        }
+        .kuc_runtime {
+            . += 106496;
+            __kuc_runtime_start__ = .;
+            *(.kuc_runtime*)
+            . = ALIGN(4);
+            __kuc_runtime_end__ = .;
+        }
+    } > RAM AT> FLASH
+    __kuc_runtime_source__ = LOADADDR(.kuc_runtime) + 106496;
+    ASSERT(SIZEOF(.cart_workspace) == 131072, "cartridge workspace must remain 128 KiB")
+    ASSERT(SIZEOF(.kuc_runtime) <= 122880, "KUC runtime overlaps upper menu ROM")
+
     .heap (NOLOAD):
     {
         __end__ = .;
@@ -244,6 +266,11 @@ SECTIONS
 
     /* Check if data + heap + stack exceeds RAM limit */
     ASSERT(__StackLimit >= __HeapLimit, "region RAM overflowed")
+    ASSERT(__scratch_x_end__ <= __StackOneBottom, "scratch X overlaps core1 stack")
+    ASSERT(SIZEOF(.scratch_x) == 8192, "loader exchange must occupy 8 KiB scratch X")
+    ASSERT(SIZEOF(.stack1_dummy) == 8192, "core1 stack must remain 8 KiB")
+    ASSERT(SIZEOF(.stack_dummy) == 16384, "core0 stack must remain 16 KiB")
+    ASSERT(SIZEOF(.heap) == 2048, "heap must remain 2 KiB")
 
     ASSERT( __binary_info_header_end - __logical_binary_start <= 256, "Binary info must be in first 256 bytes of the binary")
     /* todo assert on extra code */

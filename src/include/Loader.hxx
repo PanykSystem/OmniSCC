@@ -68,8 +68,9 @@ public:
     // ROM window at all: every read outside the SCC and command windows returns
     // 0xFF, so the MSX BIOS finds no "AB" header and carries on booting to disk
     // or BASIC while SCC I/O stays live.
-    CLoader(COmniSCC& multiCart, CSCCSound& scc, const char* data = 0, bool hasRom = true);
+    CLoader(COmniSCC& multiCart, CSCCSound& scc, const char* data = 0, bool hasRom = true, const char* upperRom = nullptr);
     virtual ~CLoader();
+    bool CloseVolumeHandles();
 
     bool Execute() override; 
 
@@ -89,16 +90,19 @@ private:
     static uint8_t exchange_buffer[LOADER_BUFFER_SIZE];
 
     // FatFs handles reused across file/directory commands.
-    FIL current_file;
-    DIR current_dir;
+    FIL current_file{};
+    DIR current_dir{};
     FILINFO file_info;
     
     CSCCSound& _scc;
+    const char* _upperRom; // borrowed staging RAM, absent for 8 KiB menus/preloader
 
     // Protocol command handlers.
+    uint8_t MapWithUpperBackup(bool nextor, int romType = -1);
     void CmdMapFile();
     void CmdMapSCC();
     void CmdMapDisk();
+    void CmdMapNextor();
     void CmdFileOpenRead();
     void CmdFileOpenWrite();
     void CmdFileReadBlock();

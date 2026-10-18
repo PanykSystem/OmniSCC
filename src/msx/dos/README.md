@@ -1,7 +1,7 @@
 # OmniSCC commands for MSX-DOS
 
 Seven independent Z80 programs call the same cartridge API as BASIC's `CALL
-MOUNT`, `CALL EJECT`, `CALL DISK` and `CALL DIR`, plus the outer-volume file
+OMOUNT`, `CALL OEJECT`, `CALL ODISK` and `CALL ODIR`, plus the outer-volume file
 commands below. They run after OmniSCC has booted a disk image and installed
 its disk interface. No BASIC program is required. File operations require
 firmware with commands `40h`–`43h`. Each `.asm` is a separate command; shared
@@ -16,7 +16,7 @@ cmake -S src/msx/dos -B src/generated/dos -G Ninja
 cmake --build src/generated/dos
 ```
 
-The output directory contains `MOUNT.COM`, `EJECT.COM`, `DISK.COM`, `ODIR.COM`,
+The output directory contains `OMOUNT.COM`, `OEJECT.COM`, `ODISK.COM`, `ODIR.COM`,
 `ODEL.COM`, `OCOPY.COM` and `ONEW.COM`. To choose the assembler, pass
 `-DSJASMPLUS_EXECUTABLE=/path/to/sjasmplus` when configuring, or set `SJASMPLUS`.
 On Windows the default is the bundled `../sjasmplus.exe`.
@@ -27,21 +27,29 @@ To assemble just one source, for example from the repository root:
 
 ```sh
 mkdir -p src/generated/dos
-(cd src/msx/dos && sjasmplus --raw=../../generated/dos/MOUNT.COM mount.asm)
+(cd src/msx/dos && sjasmplus --raw=../../generated/dos/OMOUNT.COM omount.asm)
 ```
 
 Copy the `.COM` files **inside an MSX-DOS disk image**, where DOS can run them.
 Copying them onto the cartridge's outer FAT volume alone does not put them
 inside either emulated floppy.
 
+## Command names and example disk
+
+The firmware uses identical `O`-prefixed names in BASIC (`CALL OMOUNT`, etc.)
+and DOS. The old MOUNT/EJECT/DISK executables and MOUNT/EJECT/DISK/DIR BASIC
+names are replaced. All API command numbers remain unchanged.
+`tools/OmniSCC.dsk` includes all seven tools and standard MSX-DOS 1.03
+with COMMAND.COM 1.11, requiring 64 KiB RAM.
+
 ## Commands
 
 ```text
-MOUNT GAME2.DSK
-MOUNT B:SIDE-B.DSK
-MOUNT "B:Games/Metal Gear.dsk"
-EJECT B:
-DISK
+OMOUNT GAME2.DSK
+OMOUNT B:SIDE-B.DSK
+OMOUNT "B:Games/Metal Gear.dsk"
+OEJECT B:
+ODISK
 ODIR
 ODIR GAMES
 ODEL OLD.DSK
@@ -50,16 +58,16 @@ ONEW EMPTY.DSK
 ONEW SINGLE.DSK 360
 ```
 
-- `MOUNT [A:|B:]path` replaces the image in a cartridge drive. The default is
+- `OMOUNT [A:|B:]path` replaces the image in a cartridge drive. The default is
   cartridge drive A, regardless of DOS's current drive. Paths refer to the
   cartridge's outer FAT volume, not to files inside the mounted image.
-- `EJECT [A:|B:]` leaves that drive empty; the default is A. Both media-changing
+- `OEJECT [A:|B:]` leaves that drive empty; the default is A. Both media-changing
   commands flush DOS's disk buffers before issuing the cartridge command.
-- `DISK` reports both drives, including their full paths, sizes in KiB (`K`),
+- `ODISK` reports both drives, including their full paths, sizes in KiB (`K`),
   and read-only state. A size with an odd number of sectors includes `.5K`.
 - `ODIR [path]` lists directories and `.dsk` images on the outer volume; no
   argument lists its root. An optional `A:`/`B:` prefix is ignored, as in
-  BASIC's `CALL DIR`. The different name avoids DOS's built-in `DIR` command.
+  BASIC's `CALL ODIR`. The different name avoids DOS's built-in `DIR` command.
   Output scrolls without paging; Esc or Ctrl-C stops the listing between
   entries and closes its directory handle.
 
@@ -77,14 +85,14 @@ require `.dsk`, and reject wildcards and `.`/`..` components. Copy/new transfer
 one sector per mailbox round trip. On an ordinary error they remove the partial
 output; power loss or persistent media failure can leave it behind.
 
-Use quotes around paths containing spaces. MOUNT and EJECT paths are limited to
+Use quotes around paths containing spaces. OMOUNT and OEJECT paths are limited to
 64 bytes excluding the optional drive prefix and quotes; ODEL, OCOPY and ONEW
 use the same 64-byte limit without a drive prefix. Extra arguments, invalid
 prefixes and unterminated quotes print usage without sending any API command.
 `/?` prints usage. Console output uses DOS function 06h, so `$` in a name is
 printed literally and Ctrl-C cannot bypass the listing's cleanup.
 
-Example `DISK` output:
+Example `ODISK` output:
 
 ```text
 A: GAME2.DSK  720K
@@ -97,7 +105,7 @@ interfaces exist, the first in primary-slot/subslot order is selected.
 Changing or ejecting DOS's system disk can make its next access to
 `COMMAND.COM` fail; keep the system disk available or use drive B for swaps.
 Do not change media with files still open: flushing DOS buffers does not close
-an application's files. A rejected `MOUNT` leaves the old image mounted, as
+an application's files. A rejected `OMOUNT` leaves the old image mounted, as
 defined by the cartridge API.
 
 ## API and slot access
@@ -134,22 +142,9 @@ Only DOS 1-compatible calls are used. Programs exit through address `0000h`;
 errors are printed, with no DOS 2-specific errorlevel. Buffer flushing and
 console I/O follow the [MSX-DOS function specification](https://map.grauw.nl/resources/dos2_functioncalls.php).
 
-## Verification
+## Hardware verification
 
-```sh
-python3 src/test/host/test_dos_commands.py
-bash src/test/host/run.sh
-```
-
-The tests assemble and execute the actual COM bytes on the existing Z80
-interpreter. Only DOS calls and cartridge hardware are substituted. They cover
-slot discovery (including expanded slots), inter-slot register clobbers,
-argument boundaries, API status and floating-bus waits, DOS buffer flushing,
-record decoding, directory cancellation and cleanup. The suite also checks
-that no reply overlay remains open during DOS calls and page-1 RAM is intact.
-
-These are host tests, not a complete DOS or hardware simulation. Before a
-release, run the commands under real MSX-DOS on the cartridge: mount and
+Before a release, run the commands under real MSX-DOS on the cartridge: mount and
 eject B, confirm DOS sees the media change, list the root and a subdirectory,
 check a missing path, and cancel a long listing. Repeat with an expanded slot
 and both DOS versions where available.

@@ -1,0 +1,14 @@
+{
+  "bank_count": 8,
+  "driver_bank": 7,
+  "upstream_revision": "f3e77baa45ca3938f13cc70b57e0a075373ab9f0",
+  "base_sha256": "d574417d6c607406b4ed6c01ccfc742b1e739dfe7e5e484ffb509eb90add3ab8",
+  "rom_sha256": "1e43a3d8f99b3ba68f3d321741cd65dd8b3f0774951bbb40ff3ab17b9c29fb51",
+  "exchange_start": 24576,
+  "exchange_end": 30208,
+  "assembler": "sjasmplus",
+  "packager": "MKNEXROM 1.06",
+  "kernel_patches": [
+    "BSEC_TYPE FAT prefix length 4 -> 3 at bank 0 offset 0x162B"
+  ]
+}

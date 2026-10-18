@@ -8,16 +8,25 @@
 
 #include "pico/multicore.h"
 #include "OmniSCC.hxx"
+#include <cstring>
 #include <string.h>
 #include "Loader.hxx"
 #include "KonamiCart.hxx"
 #include "KonamiSCCCart.hxx"
+#include "SCCICart.hxx"
 #include "ASCII8Cart.hxx"
 #include "ASCII16Cart.hxx"
 #include "DiskCart.hxx"
+#include "NextorCart.hxx"
+#include "NextorVolume.hxx"
+#include "VolumeAccess.h"
+extern "C" {
+#include "FlashAdapter.h"
+}
+#include <new>
 #include "RomPatcher.hxx"
 #include "hardware/flash.h"
-#include "PermStorage.hxx"
+#include "RomStorageBuilder.hxx"
 #include "hardware/clocks.h"
 #include <strings.h>
 #include "SCCSound.hxx"
@@ -25,7 +34,8 @@
 // 4-byte aligned: the disk cartridge overlays a uint32_t CLMT scratch and a
 // uint16_t sector map on the tail of this buffer, and Cortex-M0+ faults on an
 // unaligned word access.
-alignas(uint32_t) static uint8_t car_cache[0x2000*0x10];  // 128K
+alignas(uint32_t) static uint8_t car_cache[0x2000*0x10]
+    __attribute__((section(".cart_workspace"))); // 128 KiB; tail overlays KUC code.
 
 // The disk interface borrows the head of car_cache for its three RAM-resident
 // buffers -- the patched 16 KB Disk ROM, the 8 KB exchange window and the
@@ -107,8 +117,13 @@ extern "C" uint8_t* const msc_sector_scratch = &car_cache[0];
 // The loader/menu ROM gets its own buffer. car_cache is the staging area for the
 // next Mount(), and the loader is still serving code to the Z80 while that mount
 // runs, so sharing the buffer destroys the running menu when the mount fails.
-// CLoader only serves 0x4000-0x5FFF, so 8 KB covers the whole window.
-static uint8_t loader_cache[0x2000];    // 8K
+// The upper half is overlaid by payloads; the two final bytes are protocol registers.
+static uint8_t loader_cache[0x2000];    // permanent lower ROM
+// The upper menu occupies staging RAM only while the loader is current.
+// Mount handlers back it up on the 16 KiB core0 stack and restore on failure.
+static uint8_t* const loader_upper_cache = &car_cache[sizeof(car_cache)-0x2000];
+static_assert(DISK_BUFFERS_END <= sizeof(car_cache)-0x2000,
+              "disk preparation must not overwrite the active upper loader ROM");
 
 static CSCCSound g_scc;
 
@@ -170,27 +185,30 @@ COmniSCC::~COmniSCC()
         delete _current;
 }
 
-COmniSCC::CartType COmniSCC::DetectCartType(uint8_t* data, uint64_t fileSize)
+COmniSCC::CartType COmniSCC::DetectCartType(const RomStorage& storage)
 {
-    if(!strncmp((const char*)&data[16], "ASCII16X", 8))
+    const uint32_t fileSize = storage.size;
+    char signature[8];
+    for (unsigned i=0;i<8;++i) signature[i] = storage.ReadAny(16+i);
+    if(!strncmp(signature, "ASCII16X", 8))
         return CT_ASCII16X;
-    if(!strncmp((const char*)&data[16], "ROM_NEO8", 8))
+    if(!strncmp(signature, "ROM_NEO8", 8))
         return CT_NE08;
-    if(!strncmp((const char*)&data[16], "ROM_NE16", 8))
+    if(!strncmp(signature, "ROM_NE16", 8))
         return CT_NE16;
-    if(!strncmp((const char*)&data[16], "PICOMSX", 8))
+    if(fileSize >= 24 && !memcmp(signature, "OmniSCC", 8))
         return CT_Loader;
 
     if(fileSize < 0x10000)
     {
 		if ((fileSize <= 0x4000) &&
-		           (data[0] == 'A') && (data[1] == 'B')) {
-			auto initAddr = uint16_t(data[2] + 256 * data[3]);
-			auto textAddr = uint16_t(data[8] + 256 * data[9]);
+		           (storage.ReadAny(0) == 'A') && (storage.ReadAny(1) == 'B')) {
+			auto initAddr = uint16_t(storage.ReadAny(2) + 256 * storage.ReadAny(3));
+			auto textAddr = uint16_t(storage.ReadAny(8) + 256 * storage.ReadAny(9));
 			if ((textAddr & 0xC000) == 0x8000) {
 				if ((initAddr == 0) ||
 				    (((initAddr & 0xC000) == 0x8000) &&
-				     (data[initAddr & (fileSize - 1)] == 0xC9))) {
+				     (storage.ReadAny(initAddr & (fileSize - 1)) == 0xC9))) {
 					//return CT_PAGE2;
                     return CT_Plain;
 				}
@@ -208,9 +226,9 @@ COmniSCC::CartType COmniSCC::DetectCartType(uint8_t* data, uint64_t fileSize)
 
     for(int i = 0 ; i < fileSize-3; i++)
     {
-        if(data[i] == 0x32)
+        if(storage.ReadAny(i) == 0x32)
         {
-            uint16_t value = uint16_t(data[i + 1] + (data[i + 2] << 8));
+            uint16_t value = uint16_t(storage.ReadAny(i + 1) + (storage.ReadAny(i + 2) << 8));
             switch (value) {
             case 0x5000:
             case 0x9000:
@@ -282,66 +300,6 @@ uint8_t* COmniSCC::LoadToRAM(FIL* _file)
 
     return &car_cache[0];
 }
-uint8_t* COmniSCC::LoadToFlash(FIL* _file)
-{
-    FRESULT res;
-    UINT bytes_read;
-
-    uint64_t fileSize = f_size(_file);
-
-    // Pad to the same power-of-two window the mapper mask exposes (see
-    // CCartridge::MakeSizeMask), not just to the 4096-byte erase granularity:
-    // bytes between the end of the ROM and that boundary are reachable through a
-    // bank register and would otherwise still hold the previously mounted ROM.
-    uint64_t alignedSize = 4096;
-    while(alignedSize < fileSize)
-        alignedSize <<= 1;
-    
-    if(alignedSize > flash_get_permanent_storge_size())
-        return 0;
-
-    uint8_t* permFlashPtr = flash_get_permanent_storge();
-    
-    uint64_t remainingAligned = alignedSize;
-    uint64_t remainingFile = fileSize;
-    uint32_t flashOffset = 0;
-    
-    do
-    {
-        uint32_t chunkSize = (remainingAligned <= sizeof(car_cache)) 
-                              ? remainingAligned 
-                              : sizeof(car_cache);
-
-        // Read actual file data (might be less on last chunk)
-        uint32_t toRead = (remainingFile <= chunkSize) ? remainingFile : chunkSize;
-        
-        res = f_read(_file, &car_cache[0], toRead, &bytes_read);
-        if(res != FR_OK || bytes_read != toRead)
-            return 0;
-
-        // Pad with 0xFF if chunk is larger than what we read
-        if(chunkSize > toRead)
-            memset(&car_cache[toRead], 0xFF, chunkSize - toRead);
-
-        // Write to flash - check if we need to write
-        if(memcmp(permFlashPtr, &car_cache[0], chunkSize) != 0)
-        {
-            uint32_t ints = save_and_disable_interrupts();   
-            perm_flash_range_erase(flashOffset, chunkSize);
-            perm_flash_range_program(flashOffset, &car_cache[0], chunkSize);
-            restore_interrupts(ints);
-        }
-        
-        permFlashPtr += chunkSize;
-        flashOffset += chunkSize;
-        remainingAligned -= chunkSize;
-        remainingFile = (remainingFile > toRead) ? (remainingFile - toRead) : 0;
-    } while (remainingAligned > 0);
-
-    return flash_get_permanent_storge();
-}
-
-
 bool COmniSCC::MountLoader()
 {
     if(_current)
@@ -386,23 +344,36 @@ bool COmniSCC::MountDisk(const char* imagePath, const char* romPath,
     // the machine the image is meant to run on.
     const char* romName = (romPath && romPath[0]) ? romPath : _diskROMName;
 
+    _mountResult = MountResult::Unknown;
     FIL rom;
-    if (f_open(&rom, romName, FA_READ) != FR_OK)
+    const FRESULT opened = f_open(&rom, romName, FA_READ);
+    if (opened != FR_OK) {
+        _mountResult = MountFileMissing(opened) ? MountResult::DiskRomMissing
+                                               : MountResult::DiskRomRead;
         return false;
+    }
 
     UINT got = 0;
     const FRESULT rd = f_read(&rom, disk_rom_cache, DISKROM_SIZE, &got);
     const FSIZE_t romSize = f_size(&rom);
     f_close(&rom);
 
-    if (rd != FR_OK || got != DISKROM_SIZE || romSize != DISKROM_SIZE)
+    if (romSize != DISKROM_SIZE) {
+        _mountResult = MountResult::DiskRomSize;
         return false;
+    }
+    if (rd != FR_OK || got != DISKROM_SIZE) {
+        _mountResult = MountResult::DiskRomRead;
+        return false;
+    }
 
     RomPatchInfo info;
     memset(&info, 0, sizeof(info));
 
-    if (CRomPatcher::Validate(disk_rom_cache, DISKROM_SIZE, info) != RP_OK)
+    if (CRomPatcher::Validate(disk_rom_cache, DISKROM_SIZE, info) != RP_OK) {
+        _mountResult = MountResult::UnsupportedDiskRom;
         return false;
+    }
 
     extern const uint8_t __diskstub_rom_start[];
     extern const uint8_t __diskstub_rom_size[];
@@ -414,8 +385,10 @@ bool COmniSCC::MountDisk(const char* imagePath, const char* romPath,
     // compile-time one, and nothing else ties the two together.
     if (CRomPatcher::Apply(disk_rom_cache, disk_borrow_shadow,
                            DISK_SHADOW_SIZE, __diskstub_rom_start, stubLen,
-                           __diskstub_romrel_start, info) != RP_OK)
+                           __diskstub_romrel_start, info) != RP_OK) {
+        _mountResult = MountResult::DiskRomPatch;
         return false;
+    }
 
     // Redirect the header's STATEMENT vector at 0x4004 to the BASIC window, so
     // a CALL statement BASIC does not recognise reaches our handler there.
@@ -430,8 +403,10 @@ bool COmniSCC::MountDisk(const char* imagePath, const char* romPath,
 
     _diskImage.SetDirectMap(disk_sector_map, DISK_MAP_MAX_SECTORS,
                             disk_clmt_scratch, DISK_CLMT_SCRATCH_DWORDS);
-    if (!_diskImage.Mount(imagePath))
+    if (!_diskImage.Mount(imagePath)) {
+        _mountResult = _diskImage.LastMountResult();
         return false;
+    }
 
     // Drive B, from loader.ini's disk2=. An image that will not mount is not a
     // reason to refuse the boot: the machine comes up with drive A as asked and
@@ -459,104 +434,159 @@ bool COmniSCC::MountDisk(const char* imagePath, const char* romPath,
     _current = new CDiskCartridge(*this, g_scc, disk_rom_cache,
                                   disk_exchange_buffer, disk_borrow_shadow,
                                   _diskImage, _diskImage2, _diskFiles, info);
+    _mountResult = _current ? MountResult::Ok : MountResult::Unknown;
     return _current != 0;
+}
+
+NextorBootResult COmniSCC::MountNextor(const char* romPath)
+{
+    if (volume_owner() != VOLUME_MENU) return NextorBootResult::StorageError;
+    auto read = [](uint32_t lba, uint8_t* sector, void*) -> bool {
+        return volume_read(VOLUME_MENU, sector, lba, 1) == 0;
+    };
+    auto format = ValidateNextorVolume(FAT_NUM_SECTORS, read, nullptr);
+    if (format == NextorVolumeResult::Unsupported) return NextorBootResult::UnsupportedVolume;
+    if (format != NextorVolumeResult::Compatible) return NextorBootResult::StorageError;
+    FIL file{};
+    if (f_open(&file, romPath && *romPath ? romPath : "/nextor.rom", FA_READ) != FR_OK)
+        return NextorBootResult::MissingRom;
+    const FSIZE_t size = f_size(&file);
+    if (!size || size > sizeof(car_cache) || size % 16384) {
+        f_close(&file); return NextorBootResult::InvalidRom;
+    }
+    UINT got = 0;
+    const auto result = f_read(&file, car_cache, size, &got);
+    const auto closed = f_close(&file);
+    if (result != FR_OK || got != size || closed != FR_OK) return NextorBootResult::StorageError;
+    uint8_t banks=0, driver=0;
+    if (!ValidateNextorROM(car_cache, size, banks, driver)) return NextorBootResult::InvalidRom;
+    auto* next = new(std::nothrow) CNextorCartridge(*this, g_scc, car_cache, banks, driver);
+    if (!next) return NextorBootResult::StorageError;
+    _diskFiles.Abort(); _diskImage.Unmount(); _diskImage2.Unmount();
+    if (!volume_handover(VOLUME_MENU, VOLUME_NEXTOR)) {
+        delete next; return NextorBootResult::StorageError;
+    }
+    if (_prev) delete _prev;
+    _prev = _current;
+    _current = next;
+    g_scc.reset();
+    return NextorBootResult::Ok;
 }
 
 bool COmniSCC::MountLoaderROM(const uint8_t* data, uint64_t fileSize)
 {
-    if(fileSize == 0 || fileSize > sizeof(loader_cache))
+    if(fileSize == 0 || fileSize > 0x4000)
         return false;
 
-    memcpy(loader_cache, data, (size_t)fileSize);
+    auto* candidate = new(std::nothrow) CLoader(*this, g_scc, (const char*)loader_cache, true,
+        fileSize > sizeof(loader_cache) ? (const char*)loader_upper_cache : nullptr);
+    if (!candidate) return false;
+
+    const size_t lowerSize = std::min<size_t>(fileSize, sizeof(loader_cache));
+    memcpy(loader_cache, data, lowerSize);
+    if (fileSize > sizeof(loader_cache)) {
+        const size_t upperSize = fileSize-sizeof(loader_cache);
+        memcpy(loader_upper_cache, data+sizeof(loader_cache), upperSize);
+        memset(loader_upper_cache+upperSize, 0xFF, sizeof(loader_cache)-upperSize);
+    }
     if(fileSize < sizeof(loader_cache))
         memset(&loader_cache[fileSize], 0xFF, sizeof(loader_cache) - (size_t)fileSize);
 
-    _current = new CLoader(*this, g_scc, (const char*)loader_cache);
+    _current = candidate;
 
     return _current != 0;
 }
 
+bool COmniSCC::MapperCanAddress(CartType type, uint32_t size)
+{
+    switch (type) {
+    case CT_SCCI: case CT_SCCPlus: return size <= 131072;
+    case CT_KUC: return size <= 8388608;
+    case CT_Plain: case CT_Normal: case CT_Normal0000: case CT_Mirrored4000:
+        return size <= 65536;
+    case CT_Normal4000: return size <= 49152;
+    case CT_Normal8000: return size <= 32768;
+    case CT_Generic8kB: return size <= 2097152;
+    case CT_Konami: return size <= 262144;
+    case CT_KonamiSCC: return size <= 2097152;
+    case CT_ASCII8: return size <= 2097152;
+    case CT_ASCII16: return size <= 4194304;
+    case CT_Loader: return size <= 0x4000;
+    default: return false;
+    }
+}
+
 bool COmniSCC::Mount(const char* fileName)
 {
-
-    FIL file;
-    FRESULT res = f_open(&file, fileName, FA_READ);
-    if (res == FR_OK) {
-        uint64_t fileSize = f_size(&file);
-
-        if(_current)
-        {
-            if(_prev)
-                delete _prev;
-            _prev = _current;
-            _current = 0;
-        }
-
-        uint8_t* data = 0;
-
-        if(fileSize <= sizeof(car_cache))
-            data = LoadToRAM(&file);
-        else
-            data = LoadToFlash(&file);
-            
-        f_close(&file);
-
-        if(data)
-        {
-            // Bound every mapper index by the real ROM size, capped to the buffer
-            // the ROM actually lives in. See CCartridge::MakeSizeMask().
-            const uint32_t regionLimit = (fileSize <= sizeof(car_cache))
-                                            ? (uint32_t)sizeof(car_cache)
-                                            : flash_get_permanent_storge_size();
-            const uint32_t romMask =
-                CCartridge::MakeSizeMask((uint32_t)fileSize, regionLimit);
-
-            if(!strcasecmp(_loaderROMName, fileName))               // loader cartridge
-                MountLoaderROM(data, fileSize);
-            else if(strstr(fileName, "[Plain]"))                  // force plain ROM
-                _current = new CCartridge(*this, data, romMask);
-            else if(strstr(fileName, "[Konami]"))                  // force Konami
-                _current = new CKonamiCartridge(*this, data, romMask);
-            else if(strstr(fileName, "[KonamiSCC]"))               // force Konami SCC
-                _current = new CKonamiSCCCartridge(*this, g_scc, data, romMask);
-            else if(strstr(fileName, "[ASCII16]"))                 // force ASCII16
-                _current = new CASCII16Cartridge(*this, data, romMask);
-            else if(strstr(fileName, "[ASCII8]"))                  // force ASCII8
-                _current = new CASCII8Cartridge(*this, data, romMask);
-            else
-                switch(DetectCartType(data, fileSize))
-                {
-                case CT_Plain:
-                    _current = new CCartridge(*this, data, romMask);
-                    break;
-                case CT_Konami:
-                    _current = new CKonamiCartridge(*this, data, romMask);
-                    break;
-                case CT_KonamiSCC:
-                    _current = new CKonamiSCCCartridge(*this, g_scc, data, romMask);
-                    break;
-                case CT_ASCII8:
-                    _current = new CASCII8Cartridge(*this, data, romMask);
-                    break;
-                case CT_ASCII16:
-                    _current = new CASCII16Cartridge(*this, data, romMask);
-                    break;
-                case CT_Loader:
-                    MountLoaderROM(data, fileSize);
-                    break;
-
-                default:
-                    // Detected a mapper this firmware does not emulate
-                    // (CT_ASCII16X / CT_NE08 / CT_NE16 / CT_PAGE2 / CT_MIRRORED).
-                    // Leave _current at 0 so Mount() reports failure. The loader is
-                    // still running from loader_cache, so it can show the error.
-                    break;
-                }
-        }
-        return _current != 0;
+    char path[256];
+    if (!fileName || std::strlen(fileName) >= sizeof(path)) {
+        _mountResult = MountResult::RomMissing; return false;
     }
+    std::strcpy(path, fileName);
+    CartType type;
+    return PrepareROM(path, sizeof(path), type) && MountPrepared(path, type);
+}
 
-    return false;
+bool COmniSCC::MountPrepared(const char* fileName, CartType type)
+{
+    if (type == CT_KUC) return MountKUC(fileName, car_cache, sizeof(car_cache) - 24576, g_scc);
+    _mountResult = MountResult::Unknown;
+    FIL file;
+    const FRESULT opened = f_open(&file,fileName,FA_READ);
+    if (opened != FR_OK) {
+        _mountResult = MountFileMissing(opened) ? MountResult::RomMissing : MountResult::FileRead;
+        return false;
+    }
+    RomStorage storage;
+    _mountResult = BuildRomStorage(file,car_cache,sizeof(car_cache),storage);
+    const FRESULT closed = f_close(&file);
+    if (closed != FR_OK) _mountResult = MountResult::FileRead;
+    if (_mountResult != MountResult::Ok) return false;
+    if (type == CT_LLast) type = DetectCartType(storage);
+    if (!MapperCanAddress(type,storage.size)) { _mountResult = MountResult::RomSize; return false; }
+    if (type == CT_Loader) {
+        CCartridge* old = _current;
+        _current = nullptr;
+        if (!MountLoaderROM(storage.ram,storage.size)) { _current=old; _mountResult=MountResult::RomSize; return false; }
+        if (_prev) delete _prev;
+        _prev=old;
+        _mountResult=MountResult::Ok;
+        return true;
+    }
+    if (type == CT_SCCI || type == CT_SCCPlus) {
+        // The existing workspace becomes the writable expanded sound-cartridge
+        // RAM. The upper menu has its normal rollback backup until success.
+        if (storage.kind != RomStorageKind::Ram || storage.size > sizeof(car_cache)) {
+            _mountResult = MountResult::RomSize; return false;
+        }
+        memset(car_cache + storage.size, 0xff, sizeof(car_cache) - storage.size);
+        storage.size = sizeof(car_cache);
+        storage.mask = sizeof(car_cache) - 1;
+    }
+    CCartridge* candidate = nullptr;
+    switch (type) {
+    case CT_Plain: candidate=new(std::nothrow) CCartridge(*this,storage); break;
+    case CT_Normal: candidate=new(std::nothrow) CCartridge(*this,storage,PlainRomMode::Normal); break;
+    case CT_Normal0000: candidate=new(std::nothrow) CCartridge(*this,storage,PlainRomMode::Normal0000); break;
+    case CT_Normal4000: candidate=new(std::nothrow) CCartridge(*this,storage,PlainRomMode::Normal4000); break;
+    case CT_Normal8000: candidate=new(std::nothrow) CCartridge(*this,storage,PlainRomMode::Normal8000); break;
+    case CT_Mirrored4000: candidate=new(std::nothrow) CCartridge(*this,storage,PlainRomMode::Mirrored4000); break;
+    case CT_Generic8kB: candidate=new(std::nothrow) CGeneric8kBCartridge(*this,storage); break;
+    case CT_Konami: candidate=new(std::nothrow) CKonamiCartridge(*this,storage); break;
+    case CT_SCCI: case CT_SCCPlus:
+        candidate=new(std::nothrow) CSCCICartridge(*this,g_scc,storage,type == CT_SCCPlus); break;
+    case CT_KonamiSCC: candidate=new(std::nothrow) CKonamiSCCCartridge(*this,g_scc,storage); break;
+    case CT_ASCII8: candidate=new(std::nothrow) CASCII8Cartridge(*this,storage); break;
+    case CT_ASCII16: candidate=new(std::nothrow) CASCII16Cartridge(*this,storage); break;
+    default: break;
+    }
+    if (!candidate) { _mountResult=MountResult::Unknown; return false; }
+    if (!volume_handover(VOLUME_MENU,VOLUME_ROM)) { delete candidate; _mountResult=MountResult::FileRead; return false; }
+    if (_prev) delete _prev;
+    _prev=_current;
+    _current=candidate;
+    _mountResult=MountResult::Ok;
+    return true;
 }
 
 bool COmniSCC::Start()

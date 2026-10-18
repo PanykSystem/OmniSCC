@@ -17,9 +17,16 @@
 #define NUM_FLASH_SECTORS (FS_SIZE/FLASH_SECTOR_SIZE)
 #define FAT_NUM_SECTORS ((NUM_FLASH_SECTORS-FLASH_RESERVED_SECTORS)*(FLASH_SECTOR_SIZE/FAT_SECTOR_SIZE))
 
+bool _flash_is_blank(void);
+bool flash_get_xip_page(uint32_t logicalSector, uint32_t* address);
+typedef enum { FLASH_LAYOUT_CURRENT, FLASH_LAYOUT_LEGACY, FLASH_LAYOUT_FORMATTING,
+               FLASH_LAYOUT_BLANK, FLASH_LAYOUT_UNKNOWN } FlashLayoutState;
+FlashLayoutState _flash_layout_state(void);
+bool _flash_finish_format(void);
 int _flash_mount();
-void _flash_create();
+bool _flash_create();
 void _flash_sync();
+bool _flash_sync_checked(void);
 void _flash_fs_read(uint16_t fat_sector, void *buffer);
 bool _flash_fs_write(uint16_t fat_sector, const void *buffer);
 bool _flash_fs_verify(uint16_t fat_sector, const void *buffer);

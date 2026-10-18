@@ -4,7 +4,7 @@ KiCad 8 project for the base OmniSCC carrier: a 16 MB "purple" Raspberry Pi
 Pico clone soldered flat onto an MSX cartridge edge connector, with no level
 translation — the RP2040 drives the MSX bus directly at 3.3 V.
 
-![OmniSCC](../../images/OmniSCC.png)
+![OmniSCC](../../images/OmniSCC.jpg)
 
 ## Files
 

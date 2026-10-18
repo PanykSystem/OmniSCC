@@ -17,8 +17,7 @@
 
 // permananent storage size - assumed that FW size is less than 1Mb, Cartridge size is less then 1MB
 
-#define PERM_BASE    (1 * 1024 * 1024u)   // 1MB firmware size (if changed - linker script modification is needed)
-#define PERM_BYTES   (1 * 1024 * 1024u)   // 1MB max cartridge size (can be freely changed - affectr size of FAT partition)
+#define FLASH_FIRMWARE_RESERVED_BYTES 1048576u
 
 
 // ****************************************************************************
@@ -39,7 +38,7 @@ void msx_cart_main();
 }
 #endif
 
-#define FS_BASE (PERM_BASE + PERM_BYTES)
+#define FS_BASE FLASH_FIRMWARE_RESERVED_BYTES
 #define FS_SIZE (PICO_FLASH_SIZE_BYTES - FS_BASE)
 
 #define ALL_GPIO_MASK   	0x3FFFFFFF

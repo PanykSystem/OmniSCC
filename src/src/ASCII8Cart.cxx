@@ -14,6 +14,8 @@ CASCII8Cartridge::CASCII8Cartridge(COmniSCC& multiCart, uint8_t* data, uint32_t 
 
 }
 
+CASCII8Cartridge::CASCII8Cartridge(COmniSCC& multiCart, const RomStorage& storage): CCartridge(multiCart,storage) {}
+
 CASCII8Cartridge::~CASCII8Cartridge() 
 {
 
@@ -21,8 +23,14 @@ CASCII8Cartridge::~CASCII8Cartridge()
 
 bool __not_in_flash_func(CASCII8Cartridge::Execute())
 {
-    const uint8_t* mem = _data;
-    const uint32_t mask = _mask;
+    return _storage.kind == RomStorageKind::Ram ? ExecuteStorage<RomStorageKind::Ram>() : ExecuteStorage<RomStorageKind::Mapped>();
+}
+
+template<RomStorageKind Kind>
+bool __attribute__((noinline, section(".time_critical.ASCII8Cart_storage"))) CASCII8Cartridge::ExecuteStorage()
+{
+
+
     uint32_t pins;
     // Byte offsets, not pointers: the mask is applied at the read, so a bogus
     // bank register can never index outside the ROM.
@@ -58,7 +66,7 @@ bool __not_in_flash_func(CASCII8Cartridge::Execute())
             uint16_t page_addr = addr & 0x1FFF;
             uint16_t page = ((addr >> 13) + 2) & 0x3;
 
-            uint8_t data = mem[(pages[page] + page_addr) & mask];
+            uint8_t data = _storage.Read<Kind>(pages[page] + page_addr);
 
             gpio_put_masked(DATA_GPIO_MASK, (uint32_t)(data));
             SET_DATA_MODE_OUT;
@@ -80,7 +88,7 @@ bool __not_in_flash_func(CASCII8Cartridge::Execute())
             if ((addr >= 0x6000) && (addr < 0x8000))
             {
                 uint16_t reg = (addr >> 11) & 3;
-                pages[reg] = ((uint32_t)(data & 0x1F)) << 13;
+                pages[reg] = ((uint32_t)data) << 13;
             }
 
             releaseWait();

@@ -14,6 +14,8 @@ CASCII16Cartridge::CASCII16Cartridge(COmniSCC& multiCart, uint8_t* data, uint32_
 
 }
 
+CASCII16Cartridge::CASCII16Cartridge(COmniSCC& multiCart, const RomStorage& storage): CCartridge(multiCart,storage) {}
+
 CASCII16Cartridge::~CASCII16Cartridge() 
 {
 
@@ -21,8 +23,14 @@ CASCII16Cartridge::~CASCII16Cartridge()
 
 bool __not_in_flash_func(CASCII16Cartridge::Execute())
 {
-    const uint8_t* mem = _data;
-    const uint32_t mask = _mask;
+    return _storage.kind == RomStorageKind::Ram ? ExecuteStorage<RomStorageKind::Ram>() : ExecuteStorage<RomStorageKind::Mapped>();
+}
+
+template<RomStorageKind Kind>
+bool __attribute__((noinline, section(".time_critical.ASCII16Cart_storage"))) CASCII16Cartridge::ExecuteStorage()
+{
+
+
     uint32_t pins;
     // Byte offsets, not pointers: the mask is applied at the read, so a bogus
     // bank register can never index outside the ROM.
@@ -67,7 +75,7 @@ bool __not_in_flash_func(CASCII16Cartridge::Execute())
                 uint16_t page_addr = addr & 0x3FFF;
                 uint16_t page = (addr >> 14) - 1;
 
-                uint8_t data = mem[(pages[page] + page_addr) & mask];
+                uint8_t data = _storage.Read<Kind>(pages[page] + page_addr);
 
 #if defined(DATA_GPIO_SHIFT) && (DATA_GPIO_SHIFT > 0)
                 gpio_put_masked(DATA_GPIO_MASK, ((uint32_t)data) << DATA_GPIO_SHIFT);
@@ -111,9 +119,9 @@ bool __not_in_flash_func(CASCII16Cartridge::Execute())
             if ((addr >= 0x6000) && (addr < 0x7800) && !(addr & 0x0800))
             {
                 uint16_t page = (addr >> 12) & 1; // 0 for 0x6000, 1 for 0x7000
-                // Register holds a 64-bank index (1MB); the real index is
+                // Register holds an 8-bit bank index; the real index is
                 // bounded by the ROM size when the read applies the mask.
-                pages[page] = ((uint32_t)(data & 0x3F)) << 14;
+                pages[page] = ((uint32_t)data) << 14;
             }
 
             releaseWait();

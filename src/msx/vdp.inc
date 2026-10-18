@@ -67,10 +67,12 @@ DrawStringPadded:
     ld      a, (hl)
     or      a
     jr      z, .padSpace
+    IFNDEF EXPLORER_TEXT
     cp      13
     jr      z, .padSpace
     cp      10
     jr      z, .padSpace
+    ENDIF
     cp      ','
     jr      z, .padSpace
 
@@ -134,6 +136,9 @@ DrawString8x8:
     ret
 
 DrawChar8x8:
+    IFDEF EXPLORER_TEXT
+    call    PrintableChar
+    ENDIF
     ld      l, a
     ld      h, 0
     add     hl, hl
@@ -143,6 +148,7 @@ DrawChar8x8:
     add     hl, de                  ; HL -> glyph data
     ex      de, hl
 
+DrawGlyph8x8:
     ld      a, (TextY)
     ld      l, a
     ld      h, 0

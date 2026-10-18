@@ -14,6 +14,8 @@ CKonamiCartridge::CKonamiCartridge(COmniSCC& multiCart, uint8_t* data, uint32_t 
 
 }
 
+CKonamiCartridge::CKonamiCartridge(COmniSCC& multiCart, const RomStorage& storage): CCartridge(multiCart,storage) {}
+
 CKonamiCartridge::~CKonamiCartridge() 
 {
 
@@ -24,8 +26,14 @@ CKonamiCartridge::~CKonamiCartridge()
 
 bool __not_in_flash_func(CKonamiCartridge::Execute())
 {
-    const uint8_t* mem = _data;
-    const uint32_t mask = _mask;
+    return _storage.kind == RomStorageKind::Ram ? ExecuteStorage<RomStorageKind::Ram>() : ExecuteStorage<RomStorageKind::Mapped>();
+}
+
+template<RomStorageKind Kind>
+bool __attribute__((noinline, section(".time_critical.KonamiCart_storage"))) CKonamiCartridge::ExecuteStorage()
+{
+
+
     uint32_t pins;
     // Byte offsets, not pointers: the mask is applied at the read, so a bogus
     // bank register can never index outside the ROM.
@@ -64,7 +72,7 @@ bool __not_in_flash_func(CKonamiCartridge::Execute())
             if(page > 3)
                 page -= 2;
 
-            uint8_t data = mem[(pages[page] + page_addr) & mask];
+            uint8_t data = _storage.Read<Kind>(pages[page] + page_addr);
 
             gpio_put_masked(DATA_GPIO_MASK, (uint32_t)(data));
             SET_DATA_MODE_OUT;

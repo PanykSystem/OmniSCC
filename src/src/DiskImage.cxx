@@ -6,6 +6,7 @@
 #include "DiskImage.hxx"
 #include "DiskFormat.hxx"
 #include <string.h>
+#include <strings.h>
 
 // Read one 512-byte volume (flash) sector straight from the flash filesystem,
 // bypassing FatFs. Declared here to keep the C header's SDK includes out of
@@ -54,36 +55,119 @@ void CDiskImage::Unmount()
     }
     _sectors = 0;
 
-    // Nothing is mounted, so CMD_BASIC_INFO has nothing to report -- and
-    // Mount() calls this first, so a failed open leaves this "" rather than
-    // the path that did not actually load.
+    // Nothing is mounted, so CMD_BASIC_INFO has nothing to report.
     _path[0] = '\0';
+    _mapped = false;
+    _set.Reset();
 }
 
 bool CDiskImage::Mount(const char* path)
 {
-    Unmount();
+    return mountImage(path, true);
+}
+
+bool CDiskImage::SelectDisk(unsigned number)
+{
+    char path[DISK_SET_PATH_MAX];
+    if (!_mounted || !_set.Path(number, path)) return false;
+    if (number == _set.Current()) return true;
+    if (!mountImage(path, false)) return false;
+    _set.Selected(number);
+    return true;
+}
+
+void CDiskImage::discoverSet(const char* path)
+{
+    _set.Reset();
+    // Loader rows too long for NAME_MAX are sent as 8.3 aliases. Resolve the
+    // basename before testing the suffix, otherwise those sets never work.
+    const char* slash = strrchr(path, '/');
+    const size_t prefix = slash ? size_t(slash - path + 1) : 0;
+    char directory[DISK_SET_PATH_MAX];
+    memcpy(directory, path, prefix);
+    directory[prefix] = '\0';
+    DIR dir;
+    if (f_opendir(&dir, directory) != FR_OK) return;
+    FILINFO info;
+    bool found = false;
+    while (f_readdir(&dir, &info) == FR_OK && info.fname[0]) {
+        if (!strcasecmp(info.fname, path + prefix) ||
+            (info.altname[0] && !strcasecmp(info.altname, path + prefix))) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) { f_closedir(&dir); return; }
+    if (prefix + strlen(info.fname) >= DISK_SET_PATH_MAX) {
+        char reference[FF_LFN_BUF + 1];
+        strcpy(reference, info.fname);
+        _set.BeginAliases(directory, CDiskSet::Number(reference));
+        if (f_rewinddir(&dir) == FR_OK) {
+            while (f_readdir(&dir, &info) == FR_OK && info.fname[0]) {
+                const unsigned number = CDiskSet::SiblingNumber(reference, info.fname);
+                if (number && !(info.fattrib & AM_DIR) && info.fsize &&
+                    info.fsize % DSK_SECTOR_SIZE == 0)
+                    _set.AddAlias(number, info.altname[0] ? info.altname : info.fname);
+            }
+        }
+        f_closedir(&dir);
+        return;
+    }
+    f_closedir(&dir);
+    char canonical[DISK_SET_PATH_MAX];
+    memcpy(canonical, path, prefix);
+    strcpy(canonical + prefix, info.fname);
+    _set.Discover(canonical, [](const char* candidate) {
+        FILINFO entry;
+        return f_stat(candidate, &entry) == FR_OK && !(entry.fattrib & AM_DIR) &&
+               entry.fsize != 0 && entry.fsize % DSK_SECTOR_SIZE == 0;
+    });
+}
+
+bool CDiskImage::mountImage(const char* path, bool discover)
+{
+    _mountResult = MountResult::FileRead;
+    if (!path || !path[0] || strlen(path) >= DISK_PATH_MAX)
+        return false;
+    // The argument may be our own Path(). Keep it alive across replacement.
+    char newPath[DISK_PATH_MAX];
+    strcpy(newPath, path);
+    FIL candidate;
 
     // Prefer read/write. A file the volume will not hand over for writing is a
     // write-protected disk, not a failed mount -- the same thing the notch on a
     // real floppy does -- so fall back to read-only and tell the MSX through
     // CMD_DISK_STATUS. Setting the read-only attribute over USB is therefore
     // how a user protects an image.
-    _readOnly = false;
-    if (f_open(&_file, path, FA_READ | FA_WRITE) != FR_OK) {
-        if (f_open(&_file, path, FA_READ) != FR_OK)
+    bool readOnly = false;
+    if (f_open(&candidate, newPath, FA_READ | FA_WRITE) != FR_OK) {
+        const FRESULT opened = f_open(&candidate, newPath, FA_READ);
+        if (opened != FR_OK) {
+            _mountResult = MountFileMissing(opened) ? MountResult::DiskMissing
+                                                   : MountResult::FileRead;
             return false;
-        _readOnly = true;
+        }
+        readOnly = true;
     }
 
-    const FSIZE_t size = f_size(&_file);
+    const FSIZE_t size = f_size(&candidate);
 
     // Any whole number of sectors is a valid image; sizes are not whitelisted.
     if (size == 0 || (size % DSK_SECTOR_SIZE) != 0) {
-        f_close(&_file);
+        _mountResult = MountResult::DiskSize;
+        f_close(&candidate);
         return false;
     }
 
+    // Do not release the old handle, direct map or change flag until the new
+    // file is usable and pending writes have reached persistent storage.
+    if (_mounted && (!Sync() || f_close(&_file) != FR_OK)) {
+        f_close(&candidate);
+        return false;
+    }
+    _file = candidate;
+    _mounted = true;
+    _readOnly = readOnly;
     _sectors = (uint32_t)(size / DSK_SECTOR_SIZE);
 
     // Prefer a direct LBA -> flash-sector map: reads then bypass FatFs entirely,
@@ -103,16 +187,12 @@ bool CDiskImage::Mount(const char* path)
             _file.cltbl = 0;
     }
 
-    // Remembered for CMD_BASIC_INFO -- FatFs's FIL keeps no name, so this is
-    // the only place left to ask. Truncated rather than rejected: the mount
-    // already succeeded above, and CMD_BASIC_MOUNT is the one that caps what
-    // it will hand in at DISK_BASIC_PATH_MAX (DiskCart.hxx), one shorter than
-    // this buffer so it always fits with room for the terminator.
-    strncpy(_path, path, sizeof(_path) - 1);
-    _path[sizeof(_path) - 1] = '\0';
+    strcpy(_path, newPath);
 
     _mounted = true;
     _changed = true;
+    if (discover) discoverSet(newPath);
+    _mountResult = MountResult::Ok;
     return true;
 }
 

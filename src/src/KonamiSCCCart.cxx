@@ -17,6 +17,8 @@ CKonamiSCCCartridge::CKonamiSCCCartridge(COmniSCC& multiCart, CSCCSound& scc, ui
     _scc.reset();
 }
 
+CKonamiSCCCartridge::CKonamiSCCCartridge(COmniSCC& multiCart, CSCCSound& scc, const RomStorage& storage): CCartridge(multiCart,storage), _scc(scc) {_scc.reset();}
+
 CKonamiSCCCartridge::~CKonamiSCCCartridge() 
 {
 
@@ -37,10 +39,11 @@ CKonamiSCCCartridge::~CKonamiSCCCartridge()
  *
  * Bank switching:
  *   Writes to 0x5000/0x7000/0x9000/0xB000 select a 8 KB ROM bank using the
- *   low 6 bits of the written value.
+ *   full 8-bit written value (up to 2 MiB, extending the original 512 KiB mapper).
  *
  * SCC:
- *   Writing 0x3F to 0x9000-0x97FF enables the SCC. Once enabled, reads and
+ *   Writing a value whose low 6 bits equal 0x3F to 0x9000-0x97FF enables
+ *   the SCC. Once enabled, reads and
  *   writes in 0x9800-0x9FFF access SCC registers and take priority over the
  *   mapper bank register.
  *
@@ -48,10 +51,16 @@ CKonamiSCCCartridge::~CKonamiSCCCartridge()
  */
 bool __not_in_flash_func(CKonamiSCCCartridge::Execute())
 {
+    return _storage.kind == RomStorageKind::Ram ? ExecuteStorage<RomStorageKind::Ram>() : ExecuteStorage<RomStorageKind::Mapped>();
+}
+
+template<RomStorageKind Kind>
+bool __attribute__((noinline, section(".time_critical.KonamiSCCCart_storage"))) CKonamiSCCCartridge::ExecuteStorage()
+{
     uint32_t const irq_state = save_and_disable_interrupts();
 
-    const uint8_t* mem = _data;
-    const uint32_t mask = _mask;
+
+
     uint32_t pins;
     bool sccEnabled = false;
     // Byte offsets, not pointers: the mask is applied at the read, so a bogus
@@ -101,7 +110,7 @@ bool __not_in_flash_func(CKonamiSCCCartridge::Execute())
             if (sccEnabled && (addr >= 0x9800) && (addr < 0xA000)) {
                 data = _scc.readRegister((uint8_t)addr);
             } else {
-                data = mem[(pages[page] + page_addr) & mask];
+                data = _storage.Read<Kind>(pages[page] + page_addr);
             }            
 
             gpio_put_masked(DATA_GPIO_MASK, (uint32_t)(data));
@@ -144,7 +153,7 @@ bool __not_in_flash_func(CKonamiSCCCartridge::Execute())
                         const uint16_t page =
                             ((addr >> 13) + 2) & 0x03;
 
-                        pages[page] = ((uint32_t)(data & 0x3F)) << 13;
+                        pages[page] = ((uint32_t)data) << 13;
                     }
                 }
             }

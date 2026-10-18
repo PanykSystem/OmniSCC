@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <atomic>
 #include "SCCWriteQueue.hxx"
 
 /**
@@ -17,8 +18,36 @@ public:
     void init();
     void reset();
 
+    // Core 0 publishes one aligned gain; Core 1 reads it without a lock.
+    // Q16 keeps division out of the SRAM audio loop. reset() preserves it.
+    bool SetMasterVolume(uint8_t percent) {
+        if (percent > 100) return false;
+        masterGain_.store((uint32_t(percent) * 65536u) / 100u,
+                          std::memory_order_relaxed);
+        return true;
+    }
+
     //void writeRegister(uint8_t address, uint8_t value);
     uint8_t readRegister(uint8_t address);
+    uint8_t readKUCRegister(uint8_t address, bool plus);
+
+    // Encode the register layout on each event. A subsequent mapper mode change
+    // cannot reinterpret writes already waiting for the audio core.
+    inline bool enqueueKUCWrite(uint8_t address, uint8_t value, bool plus)
+    {
+        if (plus) {
+            if (address < 0xa0) waveShadow_[address] = value;
+        } else if (address < 0x80) {
+            waveShadow_[address] = value;
+            if (address >= 0x60) waveShadow_[address + 0x20] = value;
+        }
+        return g_sccWriteQueue.push(uint16_t(address) | (plus ? 0x1000u : 0), value);
+    }
+
+    inline bool enqueueDAC(uint8_t value)
+    {
+        return g_sccWriteQueue.push(0x2000, value);
+    }
 
     /**
      * Render/audio pump. Must be called frequently on Core 1.
@@ -59,13 +88,17 @@ private:
     static void dmaIrqHandler();
     void drainWriteQueue();
 
+    std::atomic<uint32_t> masterGain_{65536u}; // 100% at power-on
+
     // Wavetable RAM: 5 channels x 32 samples, signed 8-bit.
     int8_t wave_[5][32];
 
-    // Core-0 copy of the 4 x 32 bytes of wave RAM the Z80 can address
+    // Core-0 copy of the 5 x 32 bytes of wave RAM (the fifth requires SCC+)
     // (0x9800-0x987F), as last written. Owned entirely by Core 0: written in
     // enqueueWrite, read in readRegister, cleared in reset. See enqueueWrite.
-    uint8_t waveShadow_[128];
+    uint8_t waveShadow_[160];
+
+    uint8_t dac_ = 128; // Unsigned DAC midpoint is silence, independent of SCC gain.
 
     // Volume-adjusted copy of wave_ for fast mixing.
     int16_t volAdjustedWave_[5][32];

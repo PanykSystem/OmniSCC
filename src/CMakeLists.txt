@@ -38,6 +38,19 @@ file(MAKE_DIRECTORY "${OMNISCC_GENERATED_DIR}")
 # The Z80 disk stub is assembled twice at different origins and diffed to
 # derive its relocation table; see msx/build_stub.py.
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_command(
+    OUTPUT ${OMNISCC_GENERATED_DIR}/romdb.bin
+           ${OMNISCC_GENERATED_DIR}/mapper_database.hxx
+           ${OMNISCC_GENERATED_DIR}/mapper_tags.inc
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tools/build_mapper_database.py
+            --output ${OMNISCC_GENERATED_DIR}
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/tools/build_mapper_database.py
+            ${CMAKE_CURRENT_LIST_DIR}/tools/mapperdb/softwaredb.xml
+            ${CMAKE_CURRENT_LIST_DIR}/tools/mapperdb/custom_roms.txt
+    VERBATIM)
+add_custom_target(mapper_database ALL DEPENDS ${OMNISCC_GENERATED_DIR}/romdb.bin
+    ${OMNISCC_GENERATED_DIR}/mapper_database.hxx ${OMNISCC_GENERATED_DIR}/mapper_tags.inc)
+
 # sjasmplus runs on the host; WIN32 describes the Pico target after project().
 find_program(SJASMPLUS_EXECUTABLE NAMES sjasmplus)
 if(NOT SJASMPLUS_EXECUTABLE)
@@ -73,9 +86,26 @@ add_executable(OmniSCC
       ${CMAKE_CURRENT_LIST_DIR}/main.c
       ${CMAKE_CURRENT_LIST_DIR}/src/Cartridge.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/FlashAdapter.c
+      ${CMAKE_CURRENT_LIST_DIR}/src/NextorCart.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/NextorMemory.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/NextorMailbox.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/NextorVolume.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/VolumeAccess.c
       ${CMAKE_CURRENT_LIST_DIR}/src/FSAdapter.c
       ${CMAKE_CURRENT_LIST_DIR}/src/KonamiCart.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/KonamiSCCCart.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/SCCICart.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/KUCMapper.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/KUCFlash.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/KUCSectorSave.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/KUCSaveStorage.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/KUCCart.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/KUCMount.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/SHA256.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/SHA1.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/RomDatabase.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/RomPreparation.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/RomSelection.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/ASCII8Cart.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/ASCII16Cart.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/Loader.cxx
@@ -85,7 +115,7 @@ add_executable(OmniSCC
       ${CMAKE_CURRENT_LIST_DIR}/src/RomPatcher.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/MSCAdapter.c
       ${CMAKE_CURRENT_LIST_DIR}/src/OmniSCC.cxx
-      ${CMAKE_CURRENT_LIST_DIR}/src/PermStorage.cxx
+      ${CMAKE_CURRENT_LIST_DIR}/src/RomStorageBuilder.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/SCCSound.cxx
       ${CMAKE_CURRENT_LIST_DIR}/src/USBDescriptiors.c
       ${CMAKE_CURRENT_LIST_DIR}/libs/pico_fatfs/fatfs/ff.c
@@ -93,7 +123,7 @@ add_executable(OmniSCC
       ${CMAKE_CURRENT_LIST_DIR}/libs/pico_fatfs/fatfs/ffunicode.c
     )
 
-add_dependencies(OmniSCC diskstub)
+add_dependencies(OmniSCC diskstub mapper_database)
 
 # Ensure DiskCart.cxx is recompiled when any of the four stub blobs change
 # (the .incbin directives inside IMPORT_BIN's asm(...) embed all of them, but
@@ -113,16 +143,18 @@ set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/DiskCart.cxx
 
 target_include_directories(OmniSCC
     PRIVATE
+    ${OMNISCC_GENERATED_DIR}
     libs/pico_fatfs/fatfs
     ${CMAKE_CURRENT_LIST_DIR}/include
 )
 
 # 16megs of flash on purple pico clones
+target_compile_options(OmniSCC PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-fstack-usage>)
 target_compile_definitions(OmniSCC PRIVATE
     "OMNISCC_GENERATED_DIR=\"${OMNISCC_GENERATED_DIR}\""
     "PICO_FLASH_SIZE_BYTES=16777216"
     "PICO_STACK_SIZE=0x4000"
-    PICO_CORE1_STACK_SIZE=0x4000
+    PICO_CORE1_STACK_SIZE=0x2000
 )
 
 # Full newlib's allocator and reentrancy state consume over 1 KiB of the
@@ -154,6 +186,12 @@ pico_generate_pio_header(
 )
 
 target_link_options(OmniSCC PRIVATE -Wl,--print-memory-usage)
+
+add_custom_command(TARGET OmniSCC POST_BUILD
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/build_checks/check_memory_layout.py $<TARGET_FILE:OmniSCC>
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/build_checks/check_core1_stack.py --elf $<TARGET_FILE:OmniSCC> --su-root ${CMAKE_CURRENT_BINARY_DIR}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/build_checks/check_rom_residency.py --elf $<TARGET_FILE:OmniSCC>
+    VERBATIM)
 
 pico_enable_stdio_usb(OmniSCC 1)
 # create map/bin/hex/uf2 file in addition to ELF.
@@ -202,10 +240,33 @@ add_custom_command(
     OUTPUT ${OMNISCC_GENERATED_DIR}/loader.rom
     COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_CURRENT_SOURCE_DIR}/msx
             ${SJASMPLUS_EXECUTABLE} loader.asm
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader.asm
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msx/nextor/nextor_menu.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader.asm
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/graphic_frame.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/graphic_list.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/graphic_status.inc
             ${CMAKE_CURRENT_SOURCE_DIR}/msx/font.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_font.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fw_help.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_title.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/menu_art.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/countdown_badge.inc
             ${CMAKE_CURRENT_SOURCE_DIR}/msx/vdp.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/disk_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/audio_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/audio_controls.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fav_volume_save.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rom_database.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/kuc_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/startup_screen.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/startup_logo.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rbsc_easter_egg.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rbsc_logo.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/mapper_tags.inc
+            ${OMNISCC_GENERATED_DIR}/mapper_tags.inc
             ${CMAKE_CURRENT_SOURCE_DIR}/msx/mailbox.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/mount_errors.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/joystick.inc
             ${SJASMPLUS_EXECUTABLE}
     COMMENT "Building Z80 browser loader ROM..."
     VERBATIM
@@ -224,18 +285,85 @@ add_custom_command(
     OUTPUT ${OMNISCC_GENERATED_DIR}/loader_fav.rom
     COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_CURRENT_SOURCE_DIR}/msx
             ${SJASMPLUS_EXECUTABLE} loader_fav.asm
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_fav.asm
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msx/nextor/nextor_menu.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_fav.asm
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_fav_title.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fw_help.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/menu_art.inc
             ${CMAKE_CURRENT_SOURCE_DIR}/msx/font.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/countdown_badge.inc
             ${CMAKE_CURRENT_SOURCE_DIR}/msx/vdp.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fav_vdp.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fav_auto_ui.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fav_text.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/ui_detect.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/text_frame.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/disk_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/audio_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/audio_controls.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fav_volume_save.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rom_database.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/kuc_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/startup_screen.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/startup_logo.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rbsc_easter_egg.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rbsc_logo.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/mapper_tags.inc
+            ${OMNISCC_GENERATED_DIR}/mapper_tags.inc
             ${CMAKE_CURRENT_SOURCE_DIR}/msx/mailbox.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/mount_errors.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/joystick.inc
             ${SJASMPLUS_EXECUTABLE}
     COMMENT "Building Z80 favourites loader ROM..."
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${OMNISCC_GENERATED_DIR}/loader_auto.rom
+    COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_CURRENT_SOURCE_DIR}/msx
+            ${SJASMPLUS_EXECUTABLE} loader_auto.asm
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_auto.asm
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader.asm
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/auto_ui.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/ui_detect.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/auto_renderers.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/graphic_frame.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/graphic_list.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/graphic_status.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/text_frame.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/text_list.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/text_status.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fw_help.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/disk_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/audio_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/audio_controls.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/fav_volume_save.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rom_database.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/kuc_options.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/startup_screen.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/startup_logo.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rbsc_easter_egg.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/rbsc_logo.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/mapper_tags.inc
+            ${OMNISCC_GENERATED_DIR}/mapper_tags.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/mailbox.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/mount_errors.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/joystick.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/nextor/nextor_menu.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/vdp.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/menu_art.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/countdown_badge.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_font.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/msx/loader_title.inc
+            ${SJASMPLUS_EXECUTABLE}
+    COMMENT "Building Z80 universal 16 KiB browser ROM..."
     VERBATIM
 )
 
 add_custom_target(loader_rom ALL
     DEPENDS ${OMNISCC_GENERATED_DIR}/loader.rom
             ${OMNISCC_GENERATED_DIR}/loader_fav.rom
+            ${OMNISCC_GENERATED_DIR}/loader_auto.rom
 )
 
 # Build both loader ROMs as part of the default firmware build.
@@ -254,3 +382,8 @@ endif()
 
 # Standalone MSX-DOS clients for the cartridge disk API.
 add_subdirectory(msx/dos dos)
+
+
+set_source_files_properties(src/KUCMapper.cxx src/KUCFlash.cxx src/KUCSectorSave.cxx
+    src/KUCSaveStorage.cxx src/KUCCart.cxx
+    PROPERTIES COMPILE_OPTIONS "-fno-jump-tables;-fno-tree-switch-conversion")

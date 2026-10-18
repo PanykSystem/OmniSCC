@@ -5,6 +5,9 @@ project(OmniSCCDos NONE)
 if(NOT SJASMPLUS_EXECUTABLE)
     if(DEFINED ENV{SJASMPLUS})
         set(SJASMPLUS_EXECUTABLE "$ENV{SJASMPLUS}" CACHE FILEPATH "Z80 assembler")
+    elseif(WIN32)
+        set(SJASMPLUS_EXECUTABLE "${CMAKE_CURRENT_SOURCE_DIR}/../sjasmplus.exe"
+            CACHE FILEPATH "Z80 assembler")
     else()
         find_program(SJASMPLUS_EXECUTABLE NAMES sjasmplus)
     endif()
@@ -14,7 +17,7 @@ if(NOT SJASMPLUS_EXECUTABLE)
 endif()
 
 set(dos_outputs)
-foreach(command mount eject disk odir odel ocopy onew)
+foreach(command omount oeject odisk odir odel ocopy onew)
     string(TOUPPER "${command}" dos_name)
     set(output "${CMAKE_CURRENT_BINARY_DIR}/${dos_name}.COM")
     add_custom_command(

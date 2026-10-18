@@ -7,7 +7,7 @@
 	(title_block
 		(title "OmniSCC+")
 		(date "2026-08-31")
-		(rev "1.0")
+		(rev "1.1")
 	)
 	(lib_symbols
 		(symbol "Connector_Generic:Conn_01x20"
@@ -4343,6 +4343,12 @@
 		(uuid "1aa9564e-9e0d-4cb8-b0a5-233fdb6116d1")
 	)
 	(junction
+		(at 36.83 58.42)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "20938794-6a9e-4cda-88e6-846a0c3d18fe")
+	)
+	(junction
 		(at 67.31 172.72)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -4752,6 +4758,16 @@
 	)
 	(wire
 		(pts
+			(xy 36.83 45.72) (xy 36.83 48.26)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "0f77adb0-d7ea-4952-8bb4-24d54c439cb1")
+	)
+	(wire
+		(pts
 			(xy 86.36 73.66) (xy 93.98 73.66)
 		)
 		(stroke
@@ -5152,6 +5168,16 @@
 	)
 	(wire
 		(pts
+			(xy 36.83 58.42) (xy 55.88 58.42)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "3388506f-d8b1-4430-ae74-3d31a0d15170")
+	)
+	(wire
+		(pts
 			(xy 213.36 100.33) (xy 210.82 100.33)
 		)
 		(stroke
@@ -5369,6 +5395,16 @@
 			(type default)
 		)
 		(uuid "4c870cff-8d27-47db-8559-6150e4e4428c")
+	)
+	(wire
+		(pts
+			(xy 36.83 55.88) (xy 36.83 58.42)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "4ca7ec70-1a48-40b6-93e9-c1de87d43863")
 	)
 	(wire
 		(pts
@@ -6502,7 +6538,7 @@
 	)
 	(wire
 		(pts
-			(xy 48.26 58.42) (xy 55.88 58.42)
+			(xy 26.67 58.42) (xy 36.83 58.42)
 		)
 		(stroke
 			(width 0)
@@ -8091,7 +8127,7 @@
 		(uuid "e8ada87c-1d91-46f5-9334-e3789d34322f")
 	)
 	(label "~{RES}"
-		(at 48.26 58.42 0)
+		(at 26.67 58.42 0)
 		(effects
 			(font
 				(size 1.27 1.27)
@@ -9839,6 +9875,84 @@
 		)
 	)
 	(symbol
+		(lib_id "power:+5VA")
+		(at 36.83 45.72 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "43e69791-c5ed-418d-b064-a6ea0047d8df")
+		(property "Reference" "#PWR036"
+			(at 36.83 49.53 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "+5VA"
+			(at 36.83 40.64 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 36.83 45.72 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 36.83 45.72 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"+5VA\""
+			(at 36.83 45.72 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "ac3f808e-9b42-4ee4-868e-46054c124c2d")
+		)
+		(instances
+			(project "OmniSCC+"
+				(path "/6ab751e5-e6a2-456a-a8ab-7e7d5e1fa70a"
+					(reference "#PWR036")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "power:GND")
 		(at 248.92 83.82 0)
 		(mirror y)
@@ -10141,6 +10255,88 @@
 			(project "OmniSCC+"
 				(path "/6ab751e5-e6a2-456a-a8ab-7e7d5e1fa70a"
 					(reference "C12")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 36.83 52.07 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "5858cb90-1894-4093-83ca-4d77d192085b")
+		(property "Reference" "R7"
+			(at 39.37 50.7999 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "10K"
+			(at 39.37 53.3399 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder"
+			(at 35.052 52.07 90)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 36.83 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Resistor"
+			(at 36.83 52.07 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "2"
+			(uuid "f904cae2-7d38-4b8e-877d-8216c948ddb1")
+		)
+		(pin "1"
+			(uuid "8d330a02-d347-4556-99bc-326a158f43db")
+		)
+		(instances
+			(project "OmniSCC+"
+				(path "/6ab751e5-e6a2-456a-a8ab-7e7d5e1fa70a"
+					(reference "R7")
 					(unit 1)
 				)
 			)

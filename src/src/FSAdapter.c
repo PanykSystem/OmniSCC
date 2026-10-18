@@ -9,6 +9,7 @@
 #include "ff.h"
 #include "diskio.h"
 #include "FSAdapter.h"
+#include "VolumeAccess.h"
 #include "FlashAdapter.h"
 
 #include <stdio.h>
@@ -28,9 +29,40 @@ static FATFS g_fatfs;
 
 #define WELCOME_TXT "OmniSCC\r\n(c)2026 OSPC.club\r\nDrag ROM files in here!\r\n"
 
+static bool fs_create_failed(void);
+
+bool _fs_initialize(void)
+{
+    if (volume_owner() != VOLUME_MENU) return false;
+    // Keep raw-device readiness separate from FatFs registration. A valid
+    // flash map with an unreadable FAT must still be usable by USB MSC.
+    volume_set_ready(false);
+    flashfs_is_mounted = false;
+    f_mount(0, "", 0);
+    if (_fs_mount()) return true;
+    if (volume_is_ready()) return false;  // valid map: let the USB host repair FAT
+
+    // No usable map exists (blank/legacy/interrupted/corrupt metadata).
+    // Recreating it loses the old logical sectors; build a clean FAT as well.
+    return _fs_create();
+}
+
+static bool fs_create_failed(void)
+{
+    f_mount(0, "", 0);
+    flashfs_is_mounted = false;
+    volume_set_ready(false);
+    return false;
+}
+
 bool _fs_create()
 {
-    _flash_create();
+    if (volume_owner() != VOLUME_MENU) return false;
+    volume_set_ready(false);
+    flashfs_is_mounted = false;
+    f_mount(0, "", 0);
+    if (!_flash_create()) return false;
+    volume_set_ready(true);
     flashfs_is_mounted = true;
 
     // now create a fatfs on the flash_fs filesystem :-)
@@ -45,74 +77,64 @@ bool _fs_create()
 
     res = f_mkfs("", &defopt, work, sizeof work);
     if(res != FR_OK)
-        return false;
+        return fs_create_failed();
     res = f_mount(&g_fatfs, "", 0);
     if(res != FR_OK)
-        return false;
-    res = f_setlabel("MSXPico");
+        return fs_create_failed();
+    res = f_setlabel("OmniSCC");
     if(res != FR_OK)
-        return false;
+        return fs_create_failed();
     res = f_open(&fil, "WELCOME.TXT", FA_CREATE_NEW | FA_WRITE);
     if(res != FR_OK)
-        return false;
-    f_puts(WELCOME_TXT, &fil);
+        return fs_create_failed();
+    const int written = f_puts(WELCOME_TXT, &fil);
     res = f_close(&fil);
-    if(res != FR_OK)
-        return false;
+    if(res != FR_OK || written < 0)
+        return fs_create_failed();
 
     // Leave the volume mounted on g_fatfs for the rest of the session. This
     // used to unmount here (f_mount(0,...)); since _fs_create runs only on a
     // first boot (no valid volume yet), that left nothing mounted until the
     // next reboot and the cartridge's f_open calls failed. f_close above
     // already issued CTRL_SYNC, so the sector map is persisted regardless.
+    if (!_flash_finish_format()) return fs_create_failed();
     return true;
 }
 
 
 bool _fs_mount()
 {
+    if (volume_owner() != VOLUME_MENU) return false;
     int err = _flash_mount();
     if (err)
         return false;
 
+    volume_set_ready(true);
     flashfs_is_mounted = true;
-
-    return f_mount(&g_fatfs, "", 1) == FR_OK;
+    const bool ok = f_mount(&g_fatfs, "", 1) == FR_OK;
+    if (!ok) { f_mount(0, "", 0); flashfs_is_mounted = false; }
+    return ok;
 }
 
 bool _fs_is_mounted() { return flashfs_is_mounted; }
 
+bool _fs_unmount(void)
+{
+    if (f_mount(0, "", 0) != FR_OK) return false;
+    flashfs_is_mounted = false;
+    return true;
+}
+
 uint32_t _fs_read(uint8_t* buff, uint32_t sector, uint32_t count)
 {
     if (!flashfs_is_mounted) return RES_ERROR;
-    if (count == 0) return RES_OK;
-    if (sector >= FAT_NUM_SECTORS) return RES_PARERR;
-    if (sector + count > FAT_NUM_SECTORS) return RES_PARERR;
-
-    for (uint32_t i = 0; i < count; i++)
-        _flash_fs_read(sector + i, buff + (i * FAT_SECTOR_SIZE));
-
-    return RES_OK;
+    return volume_read(VOLUME_MENU, buff, sector, count);
 }
 
 uint32_t _fs_write(const uint8_t* buff, uint32_t sector, uint32_t count)
 {
     if (!flashfs_is_mounted) return RES_ERROR;
-    if (count == 0) return RES_OK;
-    if (sector >= FAT_NUM_SECTORS) return RES_PARERR;
-    if (sector + count > FAT_NUM_SECTORS) return RES_PARERR;
-
-    for (uint32_t i = 0; i < count; i++) {
-        if (!_flash_fs_write(sector + i, buff + (i * FAT_SECTOR_SIZE))) {
-            printf("WRITE ERROR (disk full?)\n");
-            return RES_ERROR;
-        }
-        if (!_flash_fs_verify(sector + i, buff + (i * FAT_SECTOR_SIZE))) {
-            printf("VERIFY ERROR!\n");
-            return RES_ERROR;
-        }
-    }
-    return RES_OK;
+    return volume_write(VOLUME_MENU, buff, sector, count);
 }
 
 void _fs_sync()
@@ -129,6 +151,7 @@ DRESULT disk_read (
     UINT count      /* Number of sectors to read (1..128) */
 )
 {
+    if (drv) return RES_PARERR;
     return _fs_read(buff, sector, count);
 }
 
@@ -139,6 +162,7 @@ DRESULT disk_write (
     UINT count          /* Number of sectors to write (1..128) */
 )
 {
+    if (drv) return RES_PARERR;
     return _fs_write(buff, sector, count);
 }
 
@@ -148,6 +172,7 @@ DRESULT disk_ioctl (
     void* buff      /* Pointer to the conrtol data */
 )
 {
+    if (drv) return RES_PARERR;
     DRESULT res = RES_OK;
 
     switch (cmd) {
